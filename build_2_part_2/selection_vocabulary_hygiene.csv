@@ -1,0 +1,8 @@
+# DOT S5B spec G.1 vocabulary hygiene — PROPERTY OF THE VOCABULARY (not of any book)
+# dataset_rows=177251 dataset_range=2026.01.19 15:49 → 2026.07.21 17:09 segment=2026.01..2026.07
+# oracle_sha256_12=518862bf19fb
+# ORDER IS BINDING: dead conditions excluded BEFORE equivalence classes are formed.
+# SCOPE IS BINDING: derived on the ACTIVE SEGMENT eligible universe, never hardcoded.
+# Dead conditions are EXCLUDED FROM RANKING AND TRIPLE FORMATION, never deleted from the vocabulary.
+segment,domain_of_identity_test,eligible_bars,vocabulary_total,dead_conditions,exact_duplicate_pairs,equivalence_classes,effective_vocabulary,order,dead_list,class_list
+2026.01..2026.07,ELIGIBLE UNIVERSE (ADX>=15 & Volume>50 & post-warmup),103214,249,7,4,4,238,dead excluded BEFORE equivalence classes formed (spec G.1),AT_Lookback_LT:lo;AT_Lookback_ST:lo;D2D_Dn_Count:lo;D2D_Dynamic_Sensitivity:hi;D2D_Up_Count:lo;OR_High_Dist_ATR:lo;OR_Low_Dist_ATR:lo,OBVf_Signal:==-1==OBVf_Trend_Dir:==-1 | OBVf_Signal:==1==OBVf_Trend_Dir:==1 | Trend_Concordance:==0==Trend_Conflict:==1 | Trend_Concordance:==1==Trend_Conflict:==0

@@ -1,0 +1,7 @@
+# DOT S5B spec G.2 near-duplication, domain bridging and community detection
+# dataset_rows=177251 segment=2026.01..2026.07 live_conditions=242
+# MODEST HYGIENE, NOT A REACH MECHANISM. It removes false corroboration in ranking and prevents degenerate
+# triples. It does NOT address the spec D.0 coverage gap, where 89.8% of missed thrusts have no qualifying
+# signal at all — a vocabulary-content problem no hygiene on the existing conditions can solve.
+pairs_total,pairs_ge_070,pairs_ge_080,pairs_ge_090,pairs_ge_095,median_abs_r,p90_abs_r,p99_abs_r,signed_positive,signed_negative,communities_detected,largest_community,effective_dim_90pct,effective_dim_95pct,participation_ratio,resolution,r_threshold
+29161,100,62,39,33,0.03319849947988064,0.20886762932651726,0.4956314771644279,14469,14692,175,4,126,154,46.16,1.0,0.7

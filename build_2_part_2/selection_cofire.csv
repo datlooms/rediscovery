@@ -1,0 +1,17 @@
+# DOT S5B spec C.1 entry co-firing — PROPERTY OF THE BOOK (incumbent reference)
+# dataset_rows=177251 segment=2026.01..2026.07
+# cofire(i,j) = |bars where i and j both qualify| / |bars where i qualifies|; CoFire(B) = mean over ordered pairs.
+# Entry co-firing is the MAXIMISED axis. It is never combined with the bounded failure-correlation axis.
+# STRUCTURAL FINDING: cross-direction cofire is EXACTLY ZERO on every pair, because the D2D gate admits a
+# signal only where D2D_Trend_Dir equals its direction, so long and short qualifying masks are disjoint.
+# CoFire(B) taken over ALL ordered pairs is therefore mechanically deflated by the long/short composition
+# (962 of 2450 ordered pairs are structurally zero on this book). Like DepthYield, it is only meaningful
+# WITHIN direction, and all bases are emitted here rather than a single headline number.
+direction,signals,CoFire_mean,basis
+LONG,37,0.033615,executed entry bars (incumbent fixture)
+SHORT,13,0.027096,executed entry bars (incumbent fixture)
+"ALL ordered pairs (pre-jar qualifying, spec C.1 literal)",50,0.02714,pre-jar qualifying masks with the engine true entry_ok; 2450 ordered pairs
+SAME-direction pairs only,50,0.044685,"1488 ordered pairs; the meaningful basis, see cross-direction row"
+CROSS-direction pairs only,50,0.0,"962 ordered pairs; EXACTLY ZERO BY CONSTRUCTION - the D2D gate admits a signal only where D2D_Trend_Dir == its direction, so long and short qualifying masks are disjoint on every bar"
+LONG-only pairs (pre-jar qualifying),37,0.048023,1332 ordered pairs within direction
+SHORT-only pairs (pre-jar qualifying),13,0.01619,156 ordered pairs within direction

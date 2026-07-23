@@ -1,0 +1,31 @@
+# DOT S5B spec C.2 / C.3 constraint references — computed on the ACTIVE TRAINING SEGMENT
+# dataset_rows=177251 dataset_range=2026.01.19 15:49 → 2026.07.21 17:09 segment=2026.01..2026.07
+# oracle_sha256_12=518862bf19fb
+# F_max, T_max and C_max are SEGMENT-LOCAL. Full-series values are reporting references ONLY and never
+# enter a constraint; that is what keeps the spec I walk-forward valid.
+# The absolute survival bound is evaluated on the FULL population INDEPENDENTLY of the relative bounds,
+# because a purely relative bar certifies only no-worse-than-incumbent and would certify an incumbent fault.
+# daily-loss series provenance: per-trade derivation from the committed executed-trade table; this is the ONLY derivation, there is no primary/fallback pair. POPULATION WARNING, pinned before Build 3: the S6 artifact signal_per_day_pnl.jsonl contains only gate-passing signals, whereas this derivation covers the full book. Switching to read the artifact would CHANGE THE POPULATION and therefore change TailDep, FailConc, mCVaR and every bound derived from them. Any such switch is a spec question, not a build decision.
+# RESIDUAL LIMITATION: the pairwise tail structure is measured on a MAJORITY BUT NOT ALL of the pair space,
+# retention remains associated with fire frequency, and per-pair lambda is coarse. TailDep is a real but
+# IMPRECISE constraint and must not be read as more precise than the data supports. Where TailDep and
+# FailConc disagree, FailConc and the absolute bound carry the decision.
+quantity,value,source,segment,population
+F_max (FailConc bound),3.869,incumbent FailConc on ACTIVE SEGMENT,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+TailDep (incumbent),0.3366,tau=0.2 MIN_SHARED=10,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+TailDep_null_mean,0.2689,permutation null P=500 on ACTIVE SEGMENT,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+kappa (incumbent/null),1.2519,T_max = kappa * TailDep_null(segment); dimensionless,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+C_max (mCVaR bound),-1429.06,p10 of incumbent mCVaR on ACTIVE SEGMENT,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+worst modelled day (FULL),-565.3,"absolute survival, evaluated independently of the relative bounds",2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+allowed worst day,-2000.0,FTMO ceiling -2500.0 x margin 0.8,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+absolute survival passes,True,FULL population (book + gap fillers),2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+retention_pct,65.0,share of pair space entering TailDep,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+mean_lambda_excluded,0.4298,"raw, includes degenerate k<3 pairs",2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+mean_lambda_excluded_k_ge3,0.353,degeneracy-guarded,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+exclusion_bias,ANTI-CONSERVATIVE,raw,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+exclusion_bias_degeneracy_guarded,ANTI-CONSERVATIVE,k>=3 only,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+degenerate_excluded_pairs_k_lt3,20,lambda mechanically 1/tau at k=1,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+below_floor_majority_flag,False,fires if >50% of pairs below MIN_SHARED,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+FailCorr Pearson (REPORTED ONLY),0.1031,never a constraint; retained so the divergence stays visible,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+H.2 resampling pool (post-warmup trading days),127,"the market, NOT the incumbent footprint",2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival
+H.2 days the incumbent traded,122,reported for contrast only; NOT the pool,2026.01..2026.07,BOOK for F_max/TailDep/C_max; FULL for absolute survival

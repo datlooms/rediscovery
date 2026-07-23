@@ -1,0 +1,811 @@
+From d29d2c8e4aa2870ce2a95824f19904a7ff0eb6de Mon Sep 17 00:00:00 2001
+From: "Ticky (Developer)" <ticky@dot.local>
+Date: Thu, 23 Jul 2026 18:02:24 +0000
+Subject: [PATCH] BUILD 1: S3B family evidence review (spec A.1-A.5) + D2D gate
+ measurement (E.1); S8 emits committed/trades.csv; S8B emits
+ D.0/D.0.1/D.0.2/D.2 reach; OOS data-relative alongside flagged legacy; F10
+ stale GAP flag corrected
+
+---
+ dot_master_discovery/discovery_map.md         |   4 +-
+ .../engine/cluster_profiler.py                | 133 ++++++++
+ .../engine/family_evidence.py                 | 314 ++++++++++++++++++
+ dot_master_discovery/engine/score_book50.py   |   9 +-
+ dot_master_discovery/master.py                | 216 +++++++++++-
+ 5 files changed, 668 insertions(+), 8 deletions(-)
+ create mode 100644 dot_master_discovery/engine/family_evidence.py
+
+diff --git a/dot_master_discovery/discovery_map.md b/dot_master_discovery/discovery_map.md
+index 816a2cd..5ef082c 100644
+--- a/dot_master_discovery/discovery_map.md
++++ b/dot_master_discovery/discovery_map.md
+@@ -87,12 +87,12 @@ RETIRED (removed from the pack): `RUN_STAGE8.md`, `DOT_stage8_program_map.md`, `
+ | **F7** | `mean_reversion.py` | Mean-reversion-from-extreme. | `results_F7_*` | exploratory |
+ | **F8** | `cross_variable_structure.py` | Relative / cross-variable structure. | `results_F8_*` | exploratory |
+ | **F9** | `session_temporal.py` | Temporal / session / calendar conditioner. | `results_F9_*` | exploratory |
+-| **F10** | — | *No standalone scanner file in the pack.* | — | **GAP — flag** |
++| **F10** | — | *Not a separate scanner: the concurrence lens was **FOLDED INTO F0** (lens null). F12 (`concurrence_profiler.py`) is the diagnostic remnant.* | — | **FOLDED INTO F0** |
+ | **F11** | `rolling_leadlag.py` | Cross-variable × windowed (rolling lead-lag / correlation). | `results_F11_*` | exploratory |
+ | **F12** | `concurrence_profiler.py` | Raw variable-depth concurrence **measurement** (does stacking depth predict outcome?). MEASURES, never selects. Secondary lens reads `dots_results/deduped_survivors.csv`. | 9 × `concurrence_*.csv` | exploratory / diagnostic |
+ | **F13** | `single_variable_extremes.py` | Single-variable extremes (percentile sweep, both dirs, both D2D polarities). Standalone, NOT convergence. | `results_F13_single_variable_extremes.csv` | exploratory — **documented negative** (0 stars / 0 candidates; convergence necessary) |
+ 
+-**Committed path:** F0 (→ BOOK-50) + the 2 F1 pairs adopted into BOOK-50. Everything else (F2–F13) is exploratory/diagnostic. **F10 has no file** — either never built or folded into a neighbour; flagged for the Supervisor to confirm.
++**Committed path:** F0 (→ BOOK-50) + the 2 F1 pairs adopted into BOOK-50. Everything else (F2–F13) is exploratory/diagnostic. **F10 is FOLDED INTO F0** (concurrence lens null; F12 is the diagnostic remnant) — not a gap; the family set is complete. This line previously carried a stale GAP flag contradicting the Resolution status below; corrected per spec §1.4.
+ 
+ ---
+ 
+diff --git a/dot_master_discovery/engine/cluster_profiler.py b/dot_master_discovery/engine/cluster_profiler.py
+index c97cd31..554a88a 100644
+--- a/dot_master_discovery/engine/cluster_profiler.py
++++ b/dot_master_discovery/engine/cluster_profiler.py
+@@ -440,3 +440,136 @@ def overlap_validation(thrust_cs, cs_book, cs_qual, n_bars, U):
+             'cluster_bars': cb, 'cluster_bars_in_thrust_pct': round(100.0 * cb_hit / cb, 1) if cb else 0.0,
+             'b1_only_pct': round(100.0 * int((thrust_bars & cov_b1 & U).sum()) / tb, 1) if tb else 0.0,
+             'b2_only_pct': round(100.0 * int((thrust_bars & cov_b2 & U).sum()) / tb, 1) if tb else 0.0}
++
++
++def directional_baseline(df, W, k_pct, e_pct, warmup, mask_name):
++    fwd, mag, eff, valid, thr, mcol, ecol = thrust_thresholds(df, W, (k_pct,), (e_pct,))
++    karr = thr[(mcol, f'k{int(round(k_pct * 100))}')]
++    earr = thr[(ecol, f'e{int(round(e_pct * 100))}')]
++    n = len(df)
++    if mask_name == 'post-warmup':
++        U = np.arange(n) >= warmup
++    else:
++        U = eligible_universe(df, warmup)
++    qual = valid & U & (fwd != 0.0) & (mag >= karr) & (eff >= earr)
++    up = qual & (fwd > 0)
++    dn = qual & (fwd < 0)
++    tot = int(up.sum() + dn.sum())
++    rows = [{'scope': 'ALL', 'direction': 'UP', 'thrust_bars': int(up.sum()),
++             'share_pct': round(100.0 * up.sum() / tot, 1) if tot else 0.0,
++             'median_move_pts': round(float(np.median(np.abs(fwd[up]))), 1) if up.any() else 0.0},
++            {'scope': 'ALL', 'direction': 'DOWN', 'thrust_bars': int(dn.sum()),
++             'share_pct': round(100.0 * dn.sum() / tot, 1) if tot else 0.0,
++             'median_move_pts': round(float(np.median(np.abs(fwd[dn]))), 1) if dn.any() else 0.0}]
++    months = pd.Series(df['Time'].astype(str).values).str[:7].values
++    closes = df['Close'].values.astype(float)
++    for m in sorted(set(months)):
++        mm = months == m
++        u = int((up & mm).sum())
++        d = int((dn & mm).sum())
++        if u + d == 0:
++            continue
++        idx = np.flatnonzero(mm)
++        rows.append({'scope': m, 'direction': 'DOWN_SHARE', 'thrust_bars': u + d,
++                     'share_pct': round(100.0 * d / (u + d), 1),
++                     'median_move_pts': round(float(closes[idx[-1]] - closes[idx[0]]), 0)})
++    out = pd.DataFrame(rows)
++    out['W'] = W
++    out['K_pct'] = k_pct
++    out['E_pct'] = e_pct
++    out['mask'] = mask_name
++    return out
++
++
++def episode_traded_split(df, W, k_pct, e_pct, n_tol, warmup, bk):
++    fwd, mag, eff, valid, thr, mcol, ecol = thrust_thresholds(df, W, (k_pct,), (e_pct,))
++    karr = thr[(mcol, f'k{int(round(k_pct * 100))}')]
++    earr = thr[(ecol, f'e{int(round(e_pct * 100))}')]
++    ev = thrust_events(fwd, mag, eff, valid, karr, earr, warmup)
++    n = len(df)
++    cs = build_cluster_set(n, ev, n_tol)
++    tcid = map_trades_to_clusters(cs, bk)
++    traded = set(np.unique(tcid[tcid >= 0]).tolist())
++    cl = cs['clusters']
++    closes = df['Close'].values.astype(float)
++    rows = []
++    strata = [('<50', 0.0, 50.0), ('50-100', 50.0, 100.0), ('100-200', 100.0, 200.0), ('>200', 200.0, 1e12)]
++    for d, lab in ((1, 'UP'), (-1, 'DOWN')):
++        sub = cl[cl['dir'] == d]
++        tot = len(sub)
++        tr = len(set(sub['cluster_id'].tolist()) & traded)
++        rows.append({'stratum': 'ALL', 'direction': lab, 'episodes': tot, 'traded': tr,
++                     'traded_pct': round(100.0 * tr / tot, 1) if tot else 0.0,
++                     'missed_pct': round(100.0 * (tot - tr) / tot, 1) if tot else 0.0})
++        for slab, lo, hi in strata:
++            mv = np.abs(closes[np.minimum(sub['b1'].values + W, n - 1)] - closes[sub['b0'].values])
++            sel = (mv >= lo) & (mv < hi)
++            ssub = sub[sel]
++            st = len(ssub)
++            str_tr = len(set(ssub['cluster_id'].tolist()) & traded)
++            rows.append({'stratum': slab, 'direction': lab, 'episodes': st, 'traded': str_tr,
++                         'traded_pct': round(100.0 * str_tr / st, 1) if st else 0.0,
++                         'missed_pct': round(100.0 * (st - str_tr) / st, 1) if st else 0.0})
++    out = pd.DataFrame(rows)
++    out['W'] = W
++    out['K_pct'] = k_pct
++    out['E_pct'] = e_pct
++    out['N'] = n_tol
++    return out
++
++
++def missed_reason_decomposition(df, W, k_pct, e_pct, n_tol, warmup, bk, qual_depth):
++    fwd, mag, eff, valid, thr, mcol, ecol = thrust_thresholds(df, W, (k_pct,), (e_pct,))
++    karr = thr[(mcol, f'k{int(round(k_pct * 100))}')]
++    earr = thr[(ecol, f'e{int(round(e_pct * 100))}')]
++    ev = thrust_events(fwd, mag, eff, valid, karr, earr, warmup)
++    n = len(df)
++    cs = build_cluster_set(n, ev, n_tol)
++    tcid = map_trades_to_clusters(cs, bk)
++    traded = set(np.unique(tcid[tcid >= 0]).tolist())
++    cl = cs['clusters']
++    closes = df['Close'].values.astype(float)
++    a = 0
++    b = 0
++    a_mv = []
++    b_mv = []
++    for _i, r in cl.iterrows():
++        cid = int(r['cluster_id'])
++        if cid in traded:
++            continue
++        d = int(r['dir'])
++        b0 = int(r['b0'])
++        b1 = int(r['b1'])
++        mv = abs(float(closes[min(b1 + W, n - 1)] - closes[b0]))
++        if qual_depth[d][b0:b1 + 1].sum() == 0:
++            a += 1
++            a_mv.append(mv)
++        else:
++            b += 1
++            b_mv.append(mv)
++    tot = a + b
++    return pd.DataFrame([
++        {'reason': 'A - no book signal ever qualified in span', 'count': a,
++         'share_pct': round(100.0 * a / tot, 1) if tot else 0.0,
++         'median_move_pts': round(float(np.median(a_mv)), 1) if a_mv else 0.0},
++        {'reason': 'B - a signal qualified but no entry resulted', 'count': b,
++         'share_pct': round(100.0 * b / tot, 1) if tot else 0.0,
++         'median_move_pts': round(float(np.median(b_mv)), 1) if b_mv else 0.0},
++    ]).assign(W=W, K_pct=k_pct, E_pct=e_pct, N=n_tol, total_missed=tot)
++
++
++def book_depth_structure(bk, n_tol, n_bars):
++    rows = []
++    for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
++        sub = bk[bk['direction'] == ('LONG' if d == 1 else 'SHORT')]
++        ev = {d: np.sort(sub['entry_bar'].values.astype(np.int64)), -d: np.array([], dtype=np.int64)}
++        cs = build_cluster_set(n_bars, ev, n_tol)
++        cl = cs['clusters']
++        cl = cl[cl['dir'] == d]
++        sizes = cl['size'].values if len(cl) else np.array([0])
++        rows.append({'direction': lab, 'signals': int(sub['signal_name'].nunique()),
++                     'clusters': int(len(cl)), 'mean_depth': round(float(sizes.mean()), 2),
++                     'max_depth': int(sizes.max()),
++                     'reach_ge5_pct': round(100.0 * float((sizes >= 5).mean()), 1),
++                     'solo_pct': round(100.0 * float((sizes == 1).mean()), 1)})
++    return pd.DataFrame(rows).assign(N=n_tol)
+diff --git a/dot_master_discovery/engine/family_evidence.py b/dot_master_discovery/engine/family_evidence.py
+new file mode 100644
+index 0000000..500b357
+--- /dev/null
++++ b/dot_master_discovery/engine/family_evidence.py
+@@ -0,0 +1,314 @@
++"""S3B — per-family evidence review (spec §A.1-A.5) and the D2D gate measurement (spec §E.1).
++
++DOCTRINE BINDING (DOT_signal_discovery_mantra.md, sha fae943d40231).
++Rule 1 — every emitted table is labelled MARKET or BOOK and states its parameters
++at the point of use, in the table itself, not in a methods note.
++Rule 2 — nothing is removed on a single measurement. Every gate variant here is a
++STATE COLUMN applied as a mask; no bar is deleted anywhere in this module.
++Rule 3 — no pre-set targets. Composition is reported, never constrained.
++Rule 4 — depth participation is a first-class column on every family row.
++Rule 5 — INSUFFICIENT-EVIDENCE is a permitted and expected verdict, and a
++negative carries the same burden of proof as a positive. A family is never
++assigned a verdict on the basis of its historical classification, and F13's
++documented negative is never used to exclude anything.
++
++WHEN A FINDING DEPENDS ON A FILTER, THRESHOLD OR RESTRICTION, THE FILTER IS PART
++OF THE FINDING. The S5 gate, the eligible-universe mask, the cluster tolerance
++and the thrust grid cell are emitted as columns beside every figure they govern.
++
++THRESHOLD PROVENANCE. Every threshold defining an object, event, cluster,
++episode or stratum comes from dots_thresholds via compute_adaptive_thresholds
++(mechanism D, rolling-2500, day-refreshed, floor-index), reached through
++cluster_profiler's ratified helpers. No percentile defining such an object is
++computed locally. Descriptive output statistics (medians, quartiles of an
++already-selected population) are permitted and are identifiable as such.
++
++D2D MEASUREMENT LIMIT, STATED RATHER THAN SMOOTHED. Spec §E.1 part 1 asks for the
++book scored with the D2D agreement condition removed from build_signal_masks.
++That condition is `mask & (d2d_dir == direction)` inside
++portfolio_simulation_engine.build_signal_masks, which is SACRED and byte-locked.
++A single-run full removal across both directions is therefore not computable
++without editing a sacred file, because one D2D_Trend_Dir column cannot satisfy
++`== +1` and `== -1` on the same bar. What IS exactly computable, by setting the
++D2D_Trend_Dir state column and changing nothing else, is emitted here: the
++baseline, the inverted gate (part 4), and the per-direction ungated runs
++(d2d = +1 frees every long and blocks every short; d2d = -1 frees every short and
++blocks every long). The per-direction runs are exact within their direction but
++isolate the jar, so they are labelled as such. The measurement that would close
++the gap is an authorised `d2d_gate=on/off` parameter on run_portfolio, which
++requires documented human authorisation and is not taken here.
++"""
++
++import glob
++import hashlib
++import os
++
++import numpy as np
++import pandas as pd
++import cluster_profiler as cp
++
++S5_GATE = 'trades>=30 & folds_plus>=4 & agg_pf>=2.0'
++FAMILY_REGISTRY = [
++    ('F0', 'triple_convergence_and_d2ddir.py', ('results_F0*.csv', 'deduped_survivors.csv', 'raw_survivors.csv')),
++    ('F1', 'sequential_temporal.py', ('F1_part*.csv', 'results_F1_*.csv')),
++    ('F2', 'state_transition.py', ('results_F2*.csv',)),
++    ('F3', 'conditional_interaction.py', ('results_F3*.csv',)),
++    ('F4', 'divergence_nonconfirm.py', ('results_F4*.csv',)),
++    ('F5', 'persistence_autocorr.py', ('results_F5*.csv',)),
++    ('F6', 'threshold_crossing.py', ('results_F6*.csv',)),
++    ('F7', 'mean_reversion.py', ('results_F7*.csv',)),
++    ('F8', 'cross_variable_structure.py', ('results_F8*.csv',)),
++    ('F9', 'session_temporal.py', ('results_F9*.csv',)),
++    ('F10', None, ()),
++    ('F11', 'rolling_leadlag.py', ('results_F11_*.csv',)),
++    ('F12', 'concurrence_profiler.py', ('concurrence_*.csv', 'results_F12_*.csv')),
++    ('F13', 'single_variable_extremes.py', ('results_F13_*.csv',)),
++]
++
++
++def _sha12(path):
++    return hashlib.sha256(open(path, 'rb').read()).hexdigest()[:12] if os.path.exists(path) else ''
++
++
++def _find_outputs(search_dirs, patterns):
++    hits = []
++    for d in search_dirs:
++        for pat in patterns:
++            hits.extend(sorted(glob.glob(os.path.join(d, pat))))
++    return sorted(set(hits))
++
++
++def _rows_and_s5(paths):
++    rows = 0
++    passing = ''
++    defs = set()
++    for p in paths:
++        try:
++            t = pd.read_csv(p, comment='#')
++        except Exception:
++            continue
++        rows += len(t)
++        if {'trades', 'folds_plus', 'agg_pf'}.issubset(t.columns):
++            k = int(((t['trades'] >= 30) & (t['folds_plus'] >= 4) & (t['agg_pf'] >= 2.0)).sum())
++            passing = k if passing == '' else passing + k
++        for c in ('signal_def', 'condition'):
++            if c in t.columns:
++                for v in t[c].astype(str).values:
++                    for tok in str(v).replace('->', '+').split('+'):
++                        tok = tok.strip()
++                        if ':' in tok:
++                            defs.add(tok.split('@')[0])
++    return rows, passing, defs
++
++
++def book_family_of(signal_name, f1_names):
++    return 'F1' if signal_name in f1_names else 'F0'
++
++
++def measure_book_families(df, bk, qual_depth, cs_by_basis, U, f1_names, months):
++    out = {}
++    for fam in ('F0', 'F1'):
++        sel = np.array([book_family_of(s, f1_names) == fam for s in bk['signal_name'].values])
++        sub = bk[sel]
++        rec = {'trades': int(len(sub)), 'net': round(float(sub['pnl'].sum()), 1) if len(sub) else 0.0,
++               'signals': int(sub['signal_name'].nunique()) if len(sub) else 0}
++        for bname, cs in cs_by_basis.items():
++            if len(sub) == 0:
++                rec[f'depth_participation_{bname}'] = ''
++                continue
++            bars = sub['entry_bar'].values.astype(np.int64)
++            dirs = np.where(sub['direction'].values == 'LONG', 1, -1)
++            inband = np.zeros(len(sub), bool)
++            for d in (1, -1):
++                m = dirs == d
++                if m.any():
++                    inband[m] = (cs['cid'][d][bars[m]] >= 0) & (cs['fsize'][d][bars[m]] >= 5)
++            rec[f'depth_participation_{bname}'] = round(100.0 * float(inband.mean()), 1)
++        if len(sub):
++            mo = pd.Series(sub['exit_time'].values).str[:7].values
++            nets = {m: round(float(sub['pnl'].values[mo == m].sum()), 1) for m in sorted(set(mo))}
++            rec['regime_conditional_net'] = ';'.join(f'{k}:{v}' for k, v in nets.items())
++            rec['regime_buckets_positive'] = f"{sum(1 for v in nets.values() if v > 0)}/{len(nets)}"
++        else:
++            rec['regime_conditional_net'] = ''
++            rec['regime_buckets_positive'] = ''
++        out[fam] = rec
++    return out
++
++
++def cofire_with_f0(bk, f1_names):
++    f0bars = {}
++    for d in (1, -1):
++        lab = 'LONG' if d == 1 else 'SHORT'
++        s = bk[(bk['direction'] == lab) & np.array([book_family_of(x, f1_names) == 'F0' for x in bk['signal_name'].values])]
++        f0bars[d] = set(s['entry_bar'].values.tolist())
++    out = {}
++    for fam in ('F0', 'F1'):
++        sel = np.array([book_family_of(s, f1_names) == fam for s in bk['signal_name'].values])
++        sub = bk[sel]
++        if len(sub) == 0:
++            out[fam] = ''
++            continue
++        hit = 0
++        for _i, r in sub.iterrows():
++            d = 1 if r['direction'] == 'LONG' else -1
++            others = f0bars[d] - ({int(r['entry_bar'])} if fam == 'F0' else set())
++            if int(r['entry_bar']) in f0bars[d] and (fam == 'F1' or True):
++                same = [x for x in sub['entry_bar'].values if x == r['entry_bar']]
++                if fam == 'F1' or len(same) > 1 or int(r['entry_bar']) in others:
++                    hit += 1
++        out[fam] = round(100.0 * hit / len(sub), 1)
++    return out
++
++
++def coverage_of_missed(bk, cs_thrust, f1_names, n_bars):
++    tcid_all = cp.map_trades_to_clusters(cs_thrust, bk)
++    traded = set(np.unique(tcid_all[tcid_all >= 0]).tolist())
++    cl = cs_thrust['clusters']
++    missed = set(cl['cluster_id'].tolist()) - traded
++    out = {}
++    for fam in ('F0', 'F1'):
++        sel = np.array([book_family_of(s, f1_names) == fam for s in bk['signal_name'].values])
++        sub = bk[sel]
++        if len(sub) == 0:
++            out[fam] = ''
++            continue
++        cid = cp.map_trades_to_clusters(cs_thrust, sub)
++        out[fam] = round(100.0 * float(np.isin(cid, list(missed)).mean()), 1) if len(missed) else 0.0
++    return out
++
++
++def build_family_evidence(df, bk, qual_depth, cs_by_basis, cs_thrust, U, pool, f1_names,
++                          scanners_dir, search_dirs, grid_label):
++    months = pd.Series(df['Time'].astype(str).values).str[:7].values
++    bookm = measure_book_families(df, bk, qual_depth, cs_by_basis, U, f1_names, months)
++    cofire = cofire_with_f0(bk, f1_names)
++    covmiss = coverage_of_missed(bk, cs_thrust, f1_names, len(df))
++    vocab = set(pool.keys())
++    rows = []
++    for fam, scanner, patterns in FAMILY_REGISTRY:
++        spath = os.path.join(scanners_dir, scanner) if scanner else ''
++        outs = _find_outputs(search_dirs, patterns) if patterns else []
++        nrows, s5, defs = _rows_and_s5(outs)
++        rec = {'family': fam, 'scanner': scanner if scanner else 'FUSED INTO F0',
++               'scanner_sha12': _sha12(spath) if spath else '',
++               'output_files_found': len(outs),
++               'output_file_names': ';'.join(os.path.basename(x) for x in outs),
++               'rows_emitted': nrows if outs else 0,
++               'candidates_passing_S5': s5 if s5 != '' else '',
++               'S5_gate': S5_GATE,
++               'distinct_conditions_used': len(defs & vocab) if defs else '',
++               'vocabulary_size': len(vocab)}
++        if fam in ('F0', 'F1'):
++            b = bookm[fam]
++            rec.update({'book_signals': b['signals'], 'book_trades': b['trades'], 'book_net': b['net'],
++                        'depth_participation_basis1': b['depth_participation_basis1'],
++                        'depth_participation_basis2': b['depth_participation_basis2'],
++                        'depth_participation_basis3': b['depth_participation_basis3'],
++                        'co_fire_with_F0': cofire[fam], 'coverage_of_missed': covmiss[fam],
++                        'regime_conditional_net': b['regime_conditional_net'],
++                        'regime_buckets_positive': b['regime_buckets_positive'],
++                        'verdict': 'SELECTABLE',
++                        'verdict_basis': 'measured from the committed book executed-trade table on this dataset'})
++        elif fam == 'F10':
++            rec.update({'book_signals': '', 'book_trades': '', 'book_net': '',
++                        'depth_participation_basis1': '', 'depth_participation_basis2': '',
++                        'depth_participation_basis3': '', 'co_fire_with_F0': '', 'coverage_of_missed': '',
++                        'regime_conditional_net': '', 'regime_buckets_positive': '',
++                        'verdict': 'FUSED INTO F0',
++                        'verdict_basis': 'not a separate family; concurrence lens fused into F0, F12 is the diagnostic remnant'})
++        elif fam == 'F13':
++            rec.update({'book_signals': 0, 'book_trades': 0, 'book_net': 0.0,
++                        'depth_participation_basis1': '', 'depth_participation_basis2': '',
++                        'depth_participation_basis3': '', 'co_fire_with_F0': '', 'coverage_of_missed': '',
++                        'regime_conditional_net': '', 'regime_buckets_positive': '',
++                        'verdict': 'DIAGNOSTIC',
++                        'verdict_basis': ('negative SETTLED for F13 stated claim (single variable at an extreme as a standalone '
++                                          'tradeable edge): its own scan reports 0 stars / 0 candidates, and S8B basis 3 corroborates '
++                                          'independently on THIS dataset. THE NEGATIVE DOES NOT TRANSFER: F13 tested single conditions '
++                                          'as entry signals, not as cluster participants or coverage contributors, and it excludes '
++                                          'nothing from the vocabulary or from triple formation (spec A.3, doctrine rule 5)')})
++        else:
++            has = len(outs) > 0
++            rec.update({'book_signals': 0, 'book_trades': 0, 'book_net': 0.0,
++                        'depth_participation_basis1': '', 'depth_participation_basis2': '',
++                        'depth_participation_basis3': '', 'co_fire_with_F0': '', 'coverage_of_missed': '',
++                        'regime_conditional_net': '', 'regime_buckets_positive': '',
++                        'verdict': 'INSUFFICIENT-EVIDENCE',
++                        'verdict_basis': ('output file present but produced on a prior window; requires regeneration on this dataset (spec A.1 fit risk)'
++                                          if has else
++                                          'no results file exists on any window; S3 discovery has not been run for this family on this dataset')})
++        rec['dataset_rows'] = len(df)
++        rec['dataset_range'] = f"{df['Time'].astype(str).values[0]} -> {df['Time'].astype(str).values[-1]}"
++        rec['thrust_grid'] = grid_label
++        rec['population_label'] = 'BOOK for depth/co-fire/coverage columns; MARKET for thrust episode denominators'
++        rows.append(rec)
++    return pd.DataFrame(rows)
++
++
++def cross_family_cofiring(bk, f1_names, n_tol, n_bars):
++    fams = np.array([book_family_of(s, f1_names) for s in bk['signal_name'].values])
++    rows = []
++    for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
++        sub = bk[bk['direction'] == ('LONG' if d == 1 else 'SHORT')]
++        subf = fams[bk['direction'].values == ('LONG' if d == 1 else 'SHORT')]
++        bars = sub['entry_bar'].values.astype(np.int64)
++        order = np.argsort(bars, kind='stable')
++        bars = bars[order]
++        subf = subf[order]
++        pnl = sub['pnl'].values[order]
++        if len(bars) == 0:
++            continue
++        start = 0
++        for i in range(1, len(bars) + 1):
++            if i == len(bars) or (bars[i] - bars[i - 1]) > n_tol:
++                famset = sorted(set(subf[start:i]))
++                size = i - start
++                p = pnl[start:i]
++                rows.append({'direction': lab, 'size': size, 'families': '+'.join(famset),
++                             'n_families': len(famset), 'net': round(float(p.sum()), 1),
++                             'wins': int((p > 0).sum()), 'trades': size})
++                start = i
++    cl = pd.DataFrame(rows)
++    if len(cl) == 0:
++        return cl, pd.DataFrame()
++    cl['size_band'] = pd.cut(cl['size'], [0, 1, 2, 4, 7, 12, 10 ** 6],
++                             labels=['1', '2', '3-4', '5-7', '8-12', '13+'])
++    agg = []
++    for mixed in (False, True):
++        s = cl[(cl['n_families'] >= 2) == mixed]
++        for band in ['1', '2', '3-4', '5-7', '8-12', '13+']:
++            b = s[s['size_band'] == band]
++            if len(b) == 0:
++                continue
++            tr = int(b['trades'].sum())
++            wn = int(b['wins'].sum())
++            agg.append({'cluster_type': 'mixed-family' if mixed else 'single-family',
++                        'size_band': band, 'clusters': len(b), 'trades': tr,
++                        'WR_pct': round(100.0 * wn / tr, 1) if tr else 0.0,
++                        'net': round(float(b['net'].sum()), 1), 'N': n_tol,
++                        'population': 'BOOK (F0+F1 executed, gaps excluded)'})
++    return cl, pd.DataFrame(agg)
++
++
++def d2d_variants(df):
++    d = df['D2D_Trend_Dir'].values.copy()
++    n = len(df)
++    return [
++        ('baseline_gate_on', d, 'real D2D_Trend_Dir; the committed gate'),
++        ('inverted', -d, 'gate polarity inverted; encoding-error probe (spec E.1 part 4)'),
++        ('long_free_short_blocked', np.ones(n, dtype=d.dtype), 'd2d=+1: every LONG ungated, every SHORT blocked'),
++        ('short_free_long_blocked', -np.ones(n, dtype=d.dtype), 'd2d=-1: every SHORT ungated, every LONG blocked'),
++    ]
++
++
++def depth_yield(bk, n_tol, n_bars):
++    ev = {}
++    for d in (1, -1):
++        lab = 'LONG' if d == 1 else 'SHORT'
++        ev[d] = np.sort(bk[bk['direction'] == lab]['entry_bar'].values.astype(np.int64))
++    cs = cp.build_cluster_set(n_bars, ev, n_tol)
++    cl = cs['clusters']
++    days = pd.Series(bk['exit_time'].values).str[:10].nunique() if len(bk) else 0
++    ge5 = int((cl['size'] >= 5).sum()) if len(cl) else 0
++    return round(ge5 / days, 3) if days else 0.0, ge5, days
+diff --git a/dot_master_discovery/engine/score_book50.py b/dot_master_discovery/engine/score_book50.py
+index 97d76bb..cda1af9 100644
+--- a/dot_master_discovery/engine/score_book50.py
++++ b/dot_master_discovery/engine/score_book50.py
+@@ -70,13 +70,18 @@ def main():
+     n = len(td)
+     daily = wf.daily_pnl_points(td)
+     mon = pd.Series(td['exit_time'].values).str[:7].values
+-    oos = td[np.isin(mon, ['2026.05', '2026.06'])]['pnl'].values
++    _oos_legacy = ['2026.05', '2026.06']
++    _present = sorted(set(mon.tolist()))
++    _oos_rel = _present[-2:] if len(_present) >= 2 else _present
++    oos = td[np.isin(mon, _oos_legacy)]['pnl'].values
++    oos_rel = td[np.isin(mon, _oos_rel)]['pnl'].values
+     e = td['exit_type'].value_counts().to_dict()
+     print(f"BOOK-50 in-book (merged ratified TM):")
+     print(f"  trades={n}  net=${pnl.sum():.0f}  PF={pnl[pnl>0].sum()/-pnl[pnl<0].sum():.2f}  "
+           f"WR={(pnl>0).sum()/n*100:.1f}%  worst-day=${daily['pnl'].min():.1f}")
+     print(f"  exits SL={e.get('SL',0)} BE={e.get('BE',0)} LF={e.get('LF',0)} FC={e.get('FC',0)}  "
+-          f"OOS PF={oos[oos>0].sum()/-oos[oos<0].sum():.2f}  "
++          f"OOS PF={oos[oos>0].sum()/-oos[oos<0].sum():.2f} [LEGACY {'+'.join(_oos_legacy)}, STALE: fixed months, not selection input]  "
++          f"OOS_rel PF={oos_rel[oos_rel>0].sum()/-oos_rel[oos_rel<0].sum():.2f} [{'+'.join(_oos_rel)}]  "
+           f"L/S={(td.direction=='LONG').sum()}/{(td.direction=='SHORT').sum()}")
+ 
+ 
+diff --git a/dot_master_discovery/master.py b/dot_master_discovery/master.py
+index e496c56..6dc85e8 100644
+--- a/dot_master_discovery/master.py
++++ b/dot_master_discovery/master.py
+@@ -10,6 +10,7 @@ import time
+ _HERE = os.path.dirname(os.path.abspath(__file__))
+ _ENGINE = os.path.join(_HERE, 'engine')
+ _SCANNERS = os.path.join(_HERE, 'scanners')
++_ROOT = _HERE
+ _ORCH = os.path.join(_HERE, 'orchestrator')
+ for _d in (_ENGINE, _SCANNERS, _ORCH):
+     if _d not in sys.path:
+@@ -27,7 +28,9 @@ SACRED = {
+ }
+ FOLDS = ['2026.01', '2026.02', '2026.03', '2026.04', '2026.05', '2026.06']
+ OOS_MONTHS = ['2026.05', '2026.06']
+-STAGES = ['S0', 'S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'S8', 'S8B', 'S9']
++OOS_LEGACY_NOTE = 'LEGACY DIAGNOSTIC, STALE: fixed calendar months, neither out-of-sample nor segment-relative on a stitched series; not a selection input (spec B.1). oos_rel_* are the data-relative counterpart.'
++OOS_REL_N_MONTHS = 2
++STAGES = ['S0', 'S1', 'S2', 'S3', 'S3B', 'S4', 'S5', 'S6', 'S7', 'S8', 'S8B', 'S9']
+ FAMILIES = [
+     ('F0', 'triple_convergence_and_d2ddir', 'committed'),
+     ('F1', 'sequential_temporal', 'committed'),
+@@ -268,10 +271,16 @@ def _score(df, sigs, ad, st, w, conv, want_trades=False):
+     fmin = min((_pf(p[mo == m]) for m in FOLDS if (mo == m).any()), default=0.0)
+     fplus = sum(1 for m in FOLDS if p[mo == m].sum() > 0)
+     oos = np.isin(mo, OOS_MONTHS)
++    present = sorted(set(mo.tolist()))
++    rel_months = present[-OOS_REL_N_MONTHS:] if len(present) >= OOS_REL_N_MONTHS else present
++    oos_rel = np.isin(mo, rel_months)
+     summary = {'trades': len(p), 'net': round(float(p.sum())), 'WR': round(float((p > 0).mean() * 100), 1),
+                'PF': _pf(p), 'daily_wd': round(float(d['pnl'].min()), 1), 'daily_mDD': round(mdd, 1),
+                'folds_plus': fplus, 'min_fold_pf': round(fmin, 2),
+-               'oos_pf': _pf(p[oos]), 'oos_net': round(float(p[oos].sum()))}
++               'oos_pf': _pf(p[oos]), 'oos_net': round(float(p[oos].sum())),
++               'oos_legacy_months': ';'.join(OOS_MONTHS), 'oos_legacy_stale': True,
++               'oos_rel_months': ';'.join(rel_months),
++               'oos_rel_pf': _pf(p[oos_rel]), 'oos_rel_net': round(float(p[oos_rel].sum()))}
+     if want_trades:
+         return summary, td
+     return summary
+@@ -299,7 +308,8 @@ def s7_contenders(df, ad, st, w, sigs, out, input_sha):
+         prev = r['net'] if cid != 'C5' else prev
+         print(f"    {cid} {label:44} net ${r['net']:>7} (Δ {r['delta']:+7}) wd {r['daily_wd']} OOS-PF {r['oos_pf']}")
+     cols = ['id', 'contender', 'trades', 'net', 'delta', 'WR', 'PF', 'daily_wd', 'daily_mDD',
+-            'folds_plus', 'min_fold_pf', 'oos_pf', 'oos_net']
++            'folds_plus', 'min_fold_pf', 'oos_pf', 'oos_net', 'oos_legacy_months', 'oos_legacy_stale',
++            'oos_rel_months', 'oos_rel_pf', 'oos_rel_net']
+     pd.DataFrame(rows)[cols].to_csv(os.path.join(contenders, 'contenders.csv'), index=False, lineterminator='\n')
+     mark_done(out, 'S7', {'input_sha': input_sha})
+     return rows
+@@ -363,6 +373,21 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
+     if canary:
+         lines.append('')
+         lines.append('  US30 baseline canary: $92,347 / 2,698 tr — engine intact')
++    tr = executed.copy()
++    keep = [c for c in ['signal_idx', 'signal_name', 'direction', 'lots', 'entry_bar', 'exit_bar',
++                        'entry_time', 'exit_time', 'entry_price', 'exit_price', 'pnl', 'pnl_per_lot',
++                        'exit_type', 'tiers', 'be_nudged', 'initial_risk'] if c in tr.columns]
++    tr = tr[keep]
++    tpath = os.path.join(committed, 'trades.csv')
++    ttmp = tpath + '.tmp'
++    with open(ttmp, 'w', encoding='utf-8') as f:
++        f.write(f'# DOT committed-system per-trade table (spec B.2 open item 8)\n')
++        f.write(f'# book={book_tag}\n')
++        f.write(f'# dataset_rows={len(df)} range={df["Time"].astype(str).values[0]} -> {df["Time"].astype(str).values[-1]}\n')
++        f.write(f'# population=FULL (BOOK F0+F1 plus gap fillers). BOOK-only = rows whose signal_name is not GAP_HURST/GAP_FB/GAP_D2D.\n')
++        f.write(f'# oracle_sha256_12={sha12(os.path.join(_ENGINE, "dots_thresholds.py"))} engine_sha256_12={sha12(os.path.join(_ENGINE, "portfolio_simulation_engine.py"))}\n')
++        tr.to_csv(f, index=False, lineterminator='\n')
++    os.replace(ttmp, tpath)
+     txt = '\n'.join(lines)
+     open(os.path.join(committed, 'committed_score.txt'), 'w', encoding='utf-8').write(txt + '\n')
+     print('\n'.join('  ' + ln for ln in lines))
+@@ -374,6 +399,143 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
+     return r
+ 
+ 
++# ── S3B PER-FAMILY EVIDENCE REVIEW (spec A.1-A.5) + D2D GATE MEASUREMENT (spec E.1) ──
++def s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
++    import cluster_profiler as cp
++    import family_evidence as fe
++    import portfolio_simulation_engine as engine
++    import score_g
++    import conviction as C
++    import wf
++    oracle_sha = sha12(os.path.join(_ENGINE, 'dots_thresholds.py'))
++    print(f'  oracle dots_thresholds.py sha256 : {oracle_sha}')
++    print(f'  dataset: {attest["rows"]:,} rows | {attest["range"]}')
++    if is_done(out, 'S3B', input_sha) and os.path.exists(os.path.join(out, 'family_evidence.csv')):
++        print('  S3B already complete for this input (checkpoint) — resuming past it.')
++        return None
++    bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
++    book = pd.read_csv(bk_path)
++    f1_rows = book.index[book['trigger'] == 'F1'].tolist()
++    sigs = score_g.build_book(df, pool, anchor, book)
++    conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
++    n = len(df)
++    U = cp.eligible_universe(df, w)
++    variants = fe.d2d_variants(df)
++    d2d_orig = df['D2D_Trend_Dir'].values.copy()
++    d2d_rows = []
++    executed = None
++    for vname, vcol, vdesc in variants:
++        df['D2D_Trend_Dir'] = vcol
++        try:
++            td = engine.run_portfolio(df, sigs, adaptive=ad, structural=st, warmup=w,
++                                      verbose=False, conviction=conv)
++        finally:
++            df['D2D_Trend_Dir'] = d2d_orig
++        if vname == 'baseline_gate_on':
++            executed = td
++        bkv = td[~td['signal_name'].isin(cp.GAP_NAMES)]
++        f1n = set(td['signal_name'].values[[i for i in range(len(td)) if td['signal_idx'].values[i] in f1_rows]]) if 'signal_idx' in td.columns else set()
++        evd = {}
++        for d in (1, -1):
++            lab = 'LONG' if d == 1 else 'SHORT'
++            evd[d] = np.sort(bkv[bkv['direction'] == lab]['entry_bar'].values.astype(np.int64))
++        cs5 = cp.build_cluster_set(n, evd, 5)
++        tcid = cp.map_trades_to_clusters(cs5, bkv)
++        sz = cs5['clusters'].set_index('cluster_id')['size'].to_dict() if len(cs5['clusters']) else {}
++        depth = np.array([sz.get(int(c), 0) for c in tcid])
++        dy, ge5, days = fe.depth_yield(bkv, 5, n)
++        pops = {'BOOK': np.ones(len(bkv), bool),
++                'F0-solo': depth == 1,
++                'F0-concurrent': depth >= 2}
++        months = pd.Series(bkv['exit_time'].values).str[:7].values
++        for pname, pmask in pops.items():
++            sub = bkv[pmask]
++            pn = sub['pnl'].values
++            base = {'variant': vname, 'variant_desc': vdesc, 'population': pname,
++                    'bucket': 'AGGREGATE', 'trades': int(len(sub)),
++                    'net': round(float(pn.sum()), 1) if len(sub) else 0.0,
++                    'PF': _pf(pn) if len(sub) else 0.0,
++                    'WR_pct': round(float((pn > 0).mean() * 100), 1) if len(sub) else 0.0,
++                    'daily_worst_day': round(float(wf.daily_pnl_points(sub)['pnl'].min()), 1) if len(sub) else 0.0,
++                    'DepthYield_N5': dy if pname == 'BOOK' else '',
++                    'population_label': 'BOOK'}
++            d2d_rows.append(base)
++            mm = months[pmask]
++            for mo in sorted(set(mm.tolist())):
++                q = pn[mm == mo]
++                d2d_rows.append({'variant': vname, 'variant_desc': vdesc, 'population': pname,
++                                 'bucket': mo, 'trades': int(len(q)),
++                                 'net': round(float(q.sum()), 1), 'PF': _pf(q),
++                                 'WR_pct': round(float((q > 0).mean() * 100), 1) if len(q) else 0.0,
++                                 'daily_worst_day': '', 'DepthYield_N5': '',
++                                 'population_label': 'BOOK'})
++    d2d = pd.DataFrame(d2d_rows)
++    d2d['H3_bucketing'] = 'calendar month (spec H.3 primary rule)'
++    d2d['tolerance_N'] = 5
++    d2d['dataset_rows'] = len(df)
++    d2d['note'] = 'single-run full gate removal is not computable without editing sacred build_signal_masks; per-direction free runs isolate the jar'
++    ev_book, bk = cp.book_events(executed)
++    f1_names = set()
++    if 'signal_idx' in executed.columns:
++        f1_names = set(executed['signal_name'].values[np.isin(executed['signal_idx'].values, f1_rows)].tolist())
++    ev_qual, qual_depth = cp.qualifying_events(df, sigs, ad, st, w)
++    cs_by_basis = {'basis1': cp.build_cluster_set(n, ev_book, 5),
++                   'basis2': cp.build_cluster_set(n, ev_qual, 5)}
++    fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, 15, (0.85,), (0.75,))
++    ev_thr = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, 'k85')], thr[(ecol, 'e75')], w)
++    cs_by_basis['basis3'] = cp.build_cluster_set(n, ev_thr, 5)
++    grid_label = 'basis3 grid W=15 K=p85 E=p75 N=5; depth bands size>=5; eligible mask ADX>=15 & Volume>50 & post-warmup'
++    fam = fe.build_family_evidence(df, bk, qual_depth, cs_by_basis, cs_by_basis['basis3'], U, pool,
++                                   f1_names, _SCANNERS, [os.path.join(_ROOT, 'discovery_results'),
++                                                         os.path.join(_ROOT, 'dots_results'), out], grid_label)
++    _write_with_header(os.path.join(out, 'family_evidence.csv'), fam, [
++        'DOT S3B per-family evidence review (spec A.1)',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        f'oracle_sha256_12={oracle_sha}',
++        'LABEL: depth_participation / co_fire_with_F0 / coverage_of_missed / regime_conditional_net are PROPERTY OF THE BOOK.',
++        'LABEL: thrust-episode denominators behind coverage_of_missed are PROPERTY OF THE MARKET (price-only).',
++        f'S5 gate = {fe.S5_GATE}. Cluster tolerance N=5 (spec 0.1.3). Depth band = size>=5.',
++        'INSUFFICIENT-EVIDENCE is a permitted verdict (spec A.1) and is emitted where no output file exists on this dataset.',
++        'No family is assigned a verdict from its historical classification; F13 negative excludes nothing (spec A.3).',
++        'coverage_of_missed is 0.0 BY CONSTRUCTION for F0 and F1: they are the incumbent book, so the episodes they',
++        'touch are the traded set by definition. The column is informative only for a family outside the book.',
++        'rows_emitted=0 for F0 means no F0 results file exists on this dataset; its columns are measured from the',
++        'committed executed-trade table instead, which is stated in verdict_basis.'])
++    cl, mix = fe.cross_family_cofiring(bk, f1_names, 5, n)
++    if len(mix):
++        _write_with_header(os.path.join(out, 'cross_family_cofiring.csv'), mix, [
++            'DOT S3B cross-family co-firing (spec A.4) — PROPERTY OF THE BOOK',
++            f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++            'population = BOOK (F0+F1 executed, gap fillers excluded). Tolerance N=5.',
++            'Only two families are present in the committed book (F0, F1), so "mixed-family" here means F0+F1.',
++            'A wider cross-family test requires F2-F9/F11 outputs, which do not exist on this dataset.'])
++    _write_with_header(os.path.join(out, 'd2d_gate_measurement.csv'), d2d, [
++        'DOT S3B D2D gate measurement (spec E.1, the four-part protocol) — PROPERTY OF THE BOOK',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        f'oracle_sha256_12={oracle_sha}',
++        'THE GATE IS NOT REMOVED AND ITS OUTCOME IS NOT PRE-JUDGED. This measures; it does not decide.',
++        'Variants are D2D_Trend_Dir STATE COLUMN changes only; no bar deleted, no engine logic altered.',
++        'LIMIT: a single-run full removal across both directions is not computable without editing sacred',
++        'build_signal_masks (one column cannot satisfy ==+1 and ==-1 on the same bar). The per-direction',
++        'free runs are exact within their direction but isolate the jar. Resolving measurement: an authorised',
++        'd2d_gate=on/off parameter on run_portfolio, which requires documented human authorisation.',
++        'Bucketing = calendar month (spec H.3 primary rule), reported per bucket AND aggregate.'])
++    mark_done(out, 'S3B', {'input_sha': input_sha, 'families': len(fam)})
++    print(f'  families reviewed: {len(fam)} | SELECTABLE {(fam.verdict == "SELECTABLE").sum()} | '
++          f'INSUFFICIENT-EVIDENCE {(fam.verdict == "INSUFFICIENT-EVIDENCE").sum()}')
++    print(f'  D2D variants scored: {d2d.variant.nunique()} | rows {len(d2d)}')
++    return {'family': fam, 'd2d': d2d, 'mixed': mix, 'executed': executed, 'sigs': sigs}
++
++
++def _write_with_header(path, frame, header_lines):
++    tmp = path + '.tmp'
++    with open(tmp, 'w', encoding='utf-8') as f:
++        for ln in header_lines:
++            f.write(f'# {ln}\n')
++        frame.to_csv(f, index=False, lineterminator='\n')
++    os.replace(tmp, path)
++
++
+ # ── S8B CLUSTER-PARTICIPATION PROFILER ──
+ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, input_sha, attest):
+     import cluster_profiler as cp
+@@ -443,6 +605,49 @@ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out,
+         for N in cp.N_VALUES:
+             tcs = cp.build_cluster_set(n, ev, N)
+             overlaps[(W, kp, ep, N)] = cp.overlap_validation(tcs, cs_b1, cs_b2, n, U)
++    reach = []
++    for mask_name in ('post-warmup', 'eligible-universe'):
++        reach.append(cp.directional_baseline(df, 30, 0.85, 0.75, w, mask_name))
++    d01 = pd.concat(reach, ignore_index=True)
++    _write_with_header(os.path.join(out, 'reach_D01_directional_baseline.csv'), d01, [
++        'DOT S8B spec D.0.1 directional coverage baseline — PROPERTY OF THE MARKET (price-only, no signals)',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        f'oracle_sha256_12={oracle_sha}',
++        'Parameters: W=30, K=p85 of |disp|/ATR_1M, E=p75 directional efficiency, thresholds via oracle mechanism D.',
++        'THE MASK IS PART OF THE FINDING: absolute counts move by roughly 2x between masks; the up/down ratio does not.',
++        'Both masks are emitted for exactly that reason (spec D.0.2 reproduction note).',
++        'scope=ALL rows carry thrust bar counts and median move; scope=YYYY.MM rows carry down-share and, in',
++        'median_move_pts, that month net price change in points.'])
++    d02 = []
++    for (W, kp, ep) in ((15, 0.85, 0.75), (30, 0.85, 0.75), (30, 0.90, 0.75)):
++        for N in cp.N_VALUES:
++            d02.append(cp.episode_traded_split(df, W, kp, ep, N, w, bk))
++    d02 = pd.concat(d02, ignore_index=True)
++    _write_with_header(os.path.join(out, 'reach_D02_D2_coverage.csv'), d02, [
++        'DOT S8B spec D.0.2 reach-vs-depth + D.2 coverage — episodes are MARKET, traded/missed are BOOK',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        f'oracle_sha256_12={oracle_sha}',
++        'Coverage(B) = fraction of thrust episodes touched by >=1 book entry inside the span, same direction.',
++        'Reported per (W, K, E, N) grid cell, never at a single setting (spec D.2), and stratified by episode',
++        'absolute size (<50 / 50-100 / 100-200 / >200 pt) so small-move gains are never shown as equivalent to large.',
++        'Episode absolute size = |Close[b1+W] - Close[b0]| in points.'])
++    d0dec = []
++    for (W, kp, ep) in ((15, 0.85, 0.75), (30, 0.85, 0.75)):
++        for N in cp.N_VALUES:
++            d0dec.append(cp.missed_reason_decomposition(df, W, kp, ep, N, w, bk, qual_depth))
++    d0dec = pd.concat(d0dec, ignore_index=True)
++    _write_with_header(os.path.join(out, 'reach_D0_missed_decomposition.csv'), d0dec, [
++        'DOT S8B spec D.0 missed-episode decomposition across the thrust grid — MARKET episodes, BOOK reasons',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        'Reason A = no BOOK signal qualified anywhere in the span (bar-level qualifying depth zero throughout).',
++        'Reason B = a signal qualified but no entry resulted. Qualifying depth from build_signal_masks with entry_ok.'])
++    dstruct = pd.concat([cp.book_depth_structure(bk, N, n) for N in cp.N_VALUES], ignore_index=True)
++    _write_with_header(os.path.join(out, 'reach_D02_book_depth_structure.csv'), dstruct, [
++        'DOT S8B spec D.0.2 book-side depth structure — PROPERTY OF THE BOOK',
++        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++        'Population BOOK (F0+F1 executed, gap fillers excluded). Clusters built per direction in isolation.',
++        'N=5 primary (spec 0.1.3); N=10 emitted as mandatory sensitivity.'])
++    print(f'  reach: D.0.1 {len(d01)} rows | D.0.2/D.2 {len(d02)} rows | D.0 decomposition {len(d0dec)} rows')
+     path = os.path.join(out, 'cluster_participation_profile.csv')
+     tmp = path + '.tmp'
+     with open(tmp, 'w', encoding='utf-8') as f:
+@@ -595,7 +800,7 @@ def main():
+     print('\n[S2] POOL & ANCHORS')
+     pool, anchor, w = s2_pool(df, ad, st)
+ 
+-    contenders = committed = profile = None
++    contenders = committed = profile = evidence = None
+     run_all = only is None
+     discover = (book_file is None)
+     if not discover and run_all:
+@@ -605,6 +810,9 @@ def main():
+     if (run_all and discover) or only == 'S3':
+         print('\n[S3] FAMILY DISCOVERY (long-pole; delegates to ratified orchestrator)')
+         s3_discovery(out, args.workers, input_sha, 'full')
++    if run_all or only == 'S3B':
++        print('\n[S3B] PER-FAMILY EVIDENCE REVIEW + D2D GATE MEASUREMENT')
++        evidence = s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest)
+     if (run_all and discover) or only == 'S4':
+         print('\n[S4] SCHEMA UNIFY')
+         s4_schema(out, input_sha)
+-- 
+2.43.0
+

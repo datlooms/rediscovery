@@ -121,6 +121,23 @@ Running `python master.py` with NO `--book` is the real scan. In order it will:
 
 So the honest answer: **you lose at most one family's worth of work, not the stage.** On the measured proof scope the slowest family was ~35s; on the full scope expect hours, so it is still worth not killing a run casually.
 
+--------------------------------------------------------
+## HOW MANY WORKERS? (`--workers`, default 2)
+
+`--workers` controls how many of the 10 discovery families run at once in S3. **Each worker loads its own copy of the data**, so memory is the limit, not cores.
+
+| workers | roughly resident | verdict on an 8 GB machine |
+|---|---|---|
+| 1 | ~0.7 GB | always safe, slowest |
+| **2 (default)** | **~1.5 GB** | **safe, recommended** |
+| 3 | ~2.2 GB | usually fine |
+| 6 | ~4.4 GB | risky with Process Lasso and a browser open |
+| 10 | ~7.2 GB | **will probably be killed by Windows** |
+
+Measured on the 177,251-row dataset: ~733 MB per worker once thresholds are built. The default is deliberately 2, not your core count — raise it only if you can watch memory.
+
+**If a worker is killed for memory**, the run does NOT silently hang: the parent prints `*** A WORKER PROCESS DIED WITHOUT RAISING ***`, keeps every family already finished, and completes the rest one at a time. You lose no completed work.
+
 **How to tell a working run from a hung one:** S3 prints a heartbeat line every 60 seconds while a family is running, plus `[family i of N]` with a running ETA. If you see nothing for several minutes, it is genuinely stuck.
 
 That's it, Animal. Two commands. One decision. Sleep.

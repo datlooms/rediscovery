@@ -1,0 +1,156 @@
+diff --git a/dot_master_discovery/QUICK_START.md b/dot_master_discovery/QUICK_START.md
+index 21f56d2..0e01377 100644
+--- a/dot_master_discovery/QUICK_START.md
++++ b/dot_master_discovery/QUICK_START.md
+@@ -121,6 +121,23 @@ Running `python master.py` with NO `--book` is the real scan. In order it will:
+ 
+ So the honest answer: **you lose at most one family's worth of work, not the stage.** On the measured proof scope the slowest family was ~35s; on the full scope expect hours, so it is still worth not killing a run casually.
+ 
++--------------------------------------------------------
++## HOW MANY WORKERS? (`--workers`, default 2)
++
++`--workers` controls how many of the 10 discovery families run at once in S3. **Each worker loads its own copy of the data**, so memory is the limit, not cores.
++
++| workers | roughly resident | verdict on an 8 GB machine |
++|---|---|---|
++| 1 | ~0.7 GB | always safe, slowest |
++| **2 (default)** | **~1.5 GB** | **safe, recommended** |
++| 3 | ~2.2 GB | usually fine |
++| 6 | ~4.4 GB | risky with Process Lasso and a browser open |
++| 10 | ~7.2 GB | **will probably be killed by Windows** |
++
++Measured on the 177,251-row dataset: ~733 MB per worker once thresholds are built. The default is deliberately 2, not your core count — raise it only if you can watch memory.
++
++**If a worker is killed for memory**, the run does NOT silently hang: the parent prints `*** A WORKER PROCESS DIED WITHOUT RAISING ***`, keeps every family already finished, and completes the rest one at a time. You lose no completed work.
++
+ **How to tell a working run from a hung one:** S3 prints a heartbeat line every 60 seconds while a family is running, plus `[family i of N]` with a running ETA. If you see nothing for several minutes, it is genuinely stuck.
+ 
+ That's it, Animal. Two commands. One decision. Sleep.
+diff --git a/dot_master_discovery/master.py b/dot_master_discovery/master.py
+index 3bab5e8..e8c22e5 100644
+--- a/dot_master_discovery/master.py
++++ b/dot_master_discovery/master.py
+@@ -203,21 +203,28 @@ def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=No
+     orch.RESULTS_DIR = results
+     frame_path = None
+     if df is not None and workers and workers > 1:
+-        frame_path = os.path.join(results, '_s3_frame.csv')
+-        if not os.path.exists(frame_path):
+-            tmp = frame_path + '.tmp'
+-            with open(tmp, 'w', encoding='utf-8', newline='') as f:
+-                df.to_csv(f, index=False, lineterminator='\n')
+-                f.flush()
+-                os.fsync(f.fileno())
+-            os.replace(tmp, frame_path)
+-        print(f'  worker frame cached at {os.path.basename(frame_path)} so each process loads it independently')
++        frame_path = os.path.join(results, f'_s3_frame_{input_sha}.csv')
++        for stale in glob.glob(os.path.join(results, '_s3_frame*.csv')):
++            if os.path.basename(stale) != os.path.basename(frame_path):
++                os.remove(stale)
++        tmp = frame_path + '.tmp'
++        with open(tmp, 'w', encoding='utf-8', newline='') as f:
++            df.to_csv(f, index=False, lineterminator='\n')
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, frame_path)
++        print(f'  worker frame written to {os.path.basename(frame_path)} so each process loads it independently')
++        print(f'  (the name carries input_sha and the file is REWRITTEN every S3 entry, so a cache from a different')
++        print(f'   dataset can never be read; it is deleted when S3 completes)')
+     print(f'  delegating to discovery_orchestrator.orchestrate(scope="{scope}", workers={workers}) — F1–F11 + F0/F13 ingest.')
+     print('  (this is the 1–2 day long pole. Per family: results land in results/ and are written ATOMICALLY with a')
+     print('   .done marker carrying the row count and CSV sha256. A restart re-reads any complete family from disk')
+     print('   and re-scans only the incomplete ones, so the worst case loss is ONE family, not the whole stage.)')
+     orch.orchestrate(scope, workers=workers, df=df, adaptive=ad, structural=st, warmup=w,
+                      frame_path=frame_path)
++    if frame_path is not None and os.path.exists(frame_path):
++        os.remove(frame_path)
++        print(f'  worker frame {os.path.basename(frame_path)} removed on S3 completion')
+     mark_done(out, 'S3', {'input_sha': input_sha, 'scope': scope, 'workers': workers})
+ 
+ 
+@@ -1377,7 +1384,7 @@ def main():
+     ap.add_argument('--data', default='/data')
+     ap.add_argument('--out', default=os.path.join(_HERE, 'discovery'))
+     ap.add_argument('--book', default=None)
+-    ap.add_argument('--workers', type=int, default=12)
++    ap.add_argument('--workers', type=int, default=2)
+     ap.add_argument('--stage', default=None, choices=STAGES)
+     ap.add_argument('--market-label', default='US30 (sealed baseline)')
+     ap.add_argument('--chunk-mb', type=int, default=9)
+diff --git a/dot_master_discovery/orchestrator/discovery_orchestrator.py b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+index de3291f..e7f4a13 100644
+--- a/dot_master_discovery/orchestrator/discovery_orchestrator.py
++++ b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+@@ -413,24 +413,58 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
+     if _mp.parent_process() is not None and workers and workers > 1:
+         print("  already inside a worker process — running sequentially to prevent recursive spawn", flush=True)
+         workers = 1
++    ran_parallel = False
+     if workers and workers > 1 and pending and frame_path is not None:
+-        from multiprocessing import get_context
++        from concurrent.futures import ProcessPoolExecutor, as_completed
++        from concurrent.futures.process import BrokenProcessPool
++        import multiprocessing as _mp2
+         payloads = [(fam, script, scope, RESULTS_DIR, frame_path) for fam, script, _m, _f in pending]
+-        ctx = get_context('spawn')
+-        print(f"  running {len(payloads)} families across {min(workers, len(payloads))} worker processes "
++        nw = min(workers, len(payloads))
++        print(f"  running {len(payloads)} families across {nw} worker processes "
+               f"(each loads its own frame; the gate column cannot be shared or corrupted)", flush=True)
++        print(f"  MEMORY: each worker holds its own copy of the frame. If a worker is killed by the OS for memory "
++              f"the parent reports it and finishes the remaining families sequentially.", flush=True)
+         t0 = time.time()
+-        with _Heartbeat(f"S3 parallel pass over {len(payloads)} families"):
+-            with ctx.Pool(min(workers, len(payloads))) as pool:
+-                done_n = 0
+-                for fam in pool.imap_unordered(_worker_entry, payloads):
+-                    done_n += 1
+-                    el = time.time() - t0
+-                    rate = el / done_n
+-                    eta = rate * (len(payloads) - done_n)
+-                    print(f"  [{done_n}/{len(payloads)}] {fam} complete | elapsed {_hms(el)} | ETA {_hms(eta)}",
+-                          flush=True)
+-    else:
++        died = False
++        try:
++            with _Heartbeat(f"S3 parallel pass over {len(payloads)} families"):
++                with ProcessPoolExecutor(max_workers=nw,
++                                         mp_context=_mp2.get_context('spawn')) as ex:
++                    futures = {ex.submit(_worker_entry, pl): pl[0] for pl in payloads}
++                    done_n = 0
++                    for fut in as_completed(futures):
++                        fam = futures[fut]
++                        try:
++                            fut.result()
++                        except BrokenProcessPool:
++                            died = True
++                            break
++                        except Exception as exc:
++                            print(f"  [{fam}] worker raised {type(exc).__name__}: {exc}", flush=True)
++                            continue
++                        done_n += 1
++                        el = time.time() - t0
++                        rate = el / done_n
++                        eta = rate * (len(payloads) - done_n)
++                        print(f"  [{done_n}/{len(payloads)}] {fam} complete | elapsed {_hms(el)} "
++                              f"| ETA {_hms(eta)}", flush=True)
++        except BrokenProcessPool:
++            died = True
++        if died:
++            print("", flush=True)
++            print("  *** A WORKER PROCESS DIED WITHOUT RAISING — almost always the OS killing it for memory. ***",
++                  flush=True)
++            print("  Families that finished are on disk and will NOT be re-scanned. Completing the rest",
++                  flush=True)
++            print("  sequentially in this process. If this recurs, lower --workers.", flush=True)
++            print("", flush=True)
++        ran_parallel = not died
++        if died:
++            pending = [(fam, script, mod, fmt) for fam, script, mod, fmt in pending
++                       if not family_is_complete(fam, script)[0]]
++        else:
++            pending = []
++    if pending and not ran_parallel:
+         for i, (fam, script, mod, fmt) in enumerate(pending, 1):
+             mean = (sum(durations) / len(durations)) if durations else None
+             eta = f" | ETA {_hms(mean * (len(pending) - i + 1))}" if mean else ""

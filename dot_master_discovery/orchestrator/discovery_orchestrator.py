@@ -413,24 +413,58 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
     if _mp.parent_process() is not None and workers and workers > 1:
         print("  already inside a worker process — running sequentially to prevent recursive spawn", flush=True)
         workers = 1
+    ran_parallel = False
     if workers and workers > 1 and pending and frame_path is not None:
-        from multiprocessing import get_context
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+        import multiprocessing as _mp2
         payloads = [(fam, script, scope, RESULTS_DIR, frame_path) for fam, script, _m, _f in pending]
-        ctx = get_context('spawn')
-        print(f"  running {len(payloads)} families across {min(workers, len(payloads))} worker processes "
+        nw = min(workers, len(payloads))
+        print(f"  running {len(payloads)} families across {nw} worker processes "
               f"(each loads its own frame; the gate column cannot be shared or corrupted)", flush=True)
+        print(f"  MEMORY: each worker holds its own copy of the frame. If a worker is killed by the OS for memory "
+              f"the parent reports it and finishes the remaining families sequentially.", flush=True)
         t0 = time.time()
-        with _Heartbeat(f"S3 parallel pass over {len(payloads)} families"):
-            with ctx.Pool(min(workers, len(payloads))) as pool:
-                done_n = 0
-                for fam in pool.imap_unordered(_worker_entry, payloads):
-                    done_n += 1
-                    el = time.time() - t0
-                    rate = el / done_n
-                    eta = rate * (len(payloads) - done_n)
-                    print(f"  [{done_n}/{len(payloads)}] {fam} complete | elapsed {_hms(el)} | ETA {_hms(eta)}",
-                          flush=True)
-    else:
+        died = False
+        try:
+            with _Heartbeat(f"S3 parallel pass over {len(payloads)} families"):
+                with ProcessPoolExecutor(max_workers=nw,
+                                         mp_context=_mp2.get_context('spawn')) as ex:
+                    futures = {ex.submit(_worker_entry, pl): pl[0] for pl in payloads}
+                    done_n = 0
+                    for fut in as_completed(futures):
+                        fam = futures[fut]
+                        try:
+                            fut.result()
+                        except BrokenProcessPool:
+                            died = True
+                            break
+                        except Exception as exc:
+                            print(f"  [{fam}] worker raised {type(exc).__name__}: {exc}", flush=True)
+                            continue
+                        done_n += 1
+                        el = time.time() - t0
+                        rate = el / done_n
+                        eta = rate * (len(payloads) - done_n)
+                        print(f"  [{done_n}/{len(payloads)}] {fam} complete | elapsed {_hms(el)} "
+                              f"| ETA {_hms(eta)}", flush=True)
+        except BrokenProcessPool:
+            died = True
+        if died:
+            print("", flush=True)
+            print("  *** A WORKER PROCESS DIED WITHOUT RAISING — almost always the OS killing it for memory. ***",
+                  flush=True)
+            print("  Families that finished are on disk and will NOT be re-scanned. Completing the rest",
+                  flush=True)
+            print("  sequentially in this process. If this recurs, lower --workers.", flush=True)
+            print("", flush=True)
+        ran_parallel = not died
+        if died:
+            pending = [(fam, script, mod, fmt) for fam, script, mod, fmt in pending
+                       if not family_is_complete(fam, script)[0]]
+        else:
+            pending = []
+    if pending and not ran_parallel:
         for i, (fam, script, mod, fmt) in enumerate(pending, 1):
             mean = (sum(durations) / len(durations)) if durations else None
             eta = f" | ETA {_hms(mean * (len(pending) - i + 1))}" if mean else ""

@@ -203,21 +203,28 @@ def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=No
     orch.RESULTS_DIR = results
     frame_path = None
     if df is not None and workers and workers > 1:
-        frame_path = os.path.join(results, '_s3_frame.csv')
-        if not os.path.exists(frame_path):
-            tmp = frame_path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                df.to_csv(f, index=False, lineterminator='\n')
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, frame_path)
-        print(f'  worker frame cached at {os.path.basename(frame_path)} so each process loads it independently')
+        frame_path = os.path.join(results, f'_s3_frame_{input_sha}.csv')
+        for stale in glob.glob(os.path.join(results, '_s3_frame*.csv')):
+            if os.path.basename(stale) != os.path.basename(frame_path):
+                os.remove(stale)
+        tmp = frame_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8', newline='') as f:
+            df.to_csv(f, index=False, lineterminator='\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, frame_path)
+        print(f'  worker frame written to {os.path.basename(frame_path)} so each process loads it independently')
+        print(f'  (the name carries input_sha and the file is REWRITTEN every S3 entry, so a cache from a different')
+        print(f'   dataset can never be read; it is deleted when S3 completes)')
     print(f'  delegating to discovery_orchestrator.orchestrate(scope="{scope}", workers={workers}) — F1–F11 + F0/F13 ingest.')
     print('  (this is the 1–2 day long pole. Per family: results land in results/ and are written ATOMICALLY with a')
     print('   .done marker carrying the row count and CSV sha256. A restart re-reads any complete family from disk')
     print('   and re-scans only the incomplete ones, so the worst case loss is ONE family, not the whole stage.)')
     orch.orchestrate(scope, workers=workers, df=df, adaptive=ad, structural=st, warmup=w,
                      frame_path=frame_path)
+    if frame_path is not None and os.path.exists(frame_path):
+        os.remove(frame_path)
+        print(f'  worker frame {os.path.basename(frame_path)} removed on S3 completion')
     mark_done(out, 'S3', {'input_sha': input_sha, 'scope': scope, 'workers': workers})
 
 
@@ -1377,7 +1384,7 @@ def main():
     ap.add_argument('--data', default='/data')
     ap.add_argument('--out', default=os.path.join(_HERE, 'discovery'))
     ap.add_argument('--book', default=None)
-    ap.add_argument('--workers', type=int, default=12)
+    ap.add_argument('--workers', type=int, default=2)
     ap.add_argument('--stage', default=None, choices=STAGES)
     ap.add_argument('--market-label', default='US30 (sealed baseline)')
     ap.add_argument('--chunk-mb', type=int, default=9)

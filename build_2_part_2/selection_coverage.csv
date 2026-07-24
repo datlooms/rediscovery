@@ -1,6 +1,0 @@
-# DOT S5B spec D.2 Coverage — episodes are MARKET, touched is BOOK
-# dataset_rows=177251 segment=2026.01..2026.07
-# Coverage(B) = fraction of thrust episodes touched by >=1 entry, same direction, entry bar inside the span.
-# Single grid cell here as a fixture; spec D.2 requires the full (W,K,E) grid, which S8B emits.
-episodes,touched,coverage_pct,W,K_pct,E_pct,N
-4744,81,1.707,15,0.85,0.75,5

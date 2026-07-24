@@ -1,9 +1,0 @@
-family,signal_def,direction,d2d_mode,gating,total_firings,firings_per_week,firings_per_day,trades,wr_post_fc,wr_pre_fc,WR,agg_pf,worst_day_usd,folds_plus,weeks_present,weeks_won,weekdays_present,weekdays_won,exit_FC,exit_EOD,persistence,survival,tier
-F13,WeeklyOpen_Side:==-1,LONG,aligned,standard,19078,867.18,179.981,277,78.7,79.0,78.7,1.425,-473.5,5,14,8,5,4,1,0,68.0,False,none
-F13,WeeklyOpen_Side:==-1,LONG,counter,standard,24389,1108.59,230.085,540,84.3,84.2,84.3,1.693,-645.9,6,19,18,6,6,2,0,96.8,False,none
-F13,WeeklyOpen_Side:==-1,SHORT,aligned,standard,24389,1108.59,230.085,496,76.4,76.7,76.4,0.969,-447.8,2,19,9,6,2,2,0,41.9,False,none
-F13,WeeklyOpen_Side:==-1,SHORT,counter,standard,19078,867.18,179.981,312,77.6,77.7,77.6,1.124,-359.0,4,14,6,5,4,2,0,56.0,False,none
-F13,WeeklyOpen_Side:==1,LONG,aligned,standard,57448,2611.27,541.962,922,79.8,79.9,79.8,1.192,-613.3,5,22,12,6,5,1,0,64.7,False,none
-F13,WeeklyOpen_Side:==1,LONG,counter,standard,52043,2365.59,490.972,798,79.8,79.9,79.8,1.22,-308.7,4,21,12,6,5,3,1,63.6,False,none
-F13,WeeklyOpen_Side:==1,SHORT,aligned,standard,52043,2365.59,490.972,795,78.4,78.4,78.4,1.103,-597.7,5,21,15,6,4,2,1,72.7,False,none
-F13,WeeklyOpen_Side:==1,SHORT,counter,standard,57448,2611.27,541.962,936,78.8,79.1,78.8,1.211,-492.9,4,22,13,6,5,3,0,64.7,False,none

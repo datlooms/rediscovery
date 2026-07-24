@@ -1,0 +1,431 @@
+From 79d36ba1bc4446ee3ccfee78b0844e65d3b452be Mon Sep 17 00:00:00 2001
+From: "Ticky (Developer)" <ticky@dot.local>
+Date: Fri, 24 Jul 2026 02:04:31 +0000
+Subject: [PATCH] BUILD 3 REMEDIATION: causality assertion now checks ALL 180
+ threshold keys with exact bitwise equality, splitting rolling-D from
+ structural constants (was a 6-key dict-head sample testing only 2 rolling
+ thresholds); rejection items 5 and 6 computed from the emitted artifact
+ rather than asserted, every check carries a basis column; per-split
+ random-triple null arm run end to end through the single-touch guard as a
+ MEASUREMENT not a pass criterion; four recorded limitations into artifact
+ headers; wall-clock excluded from artifacts to preserve determinism
+
+---
+ dot_master_discovery/engine/wf_selection.py | 185 +++++++++++++++++---
+ dot_master_discovery/master.py              |  98 +++++++++--
+ 2 files changed, 245 insertions(+), 38 deletions(-)
+
+diff --git a/dot_master_discovery/engine/wf_selection.py b/dot_master_discovery/engine/wf_selection.py
+index 9285844..9daefda 100644
+--- a/dot_master_discovery/engine/wf_selection.py
++++ b/dot_master_discovery/engine/wf_selection.py
+@@ -55,7 +55,8 @@ PERSIST_MIN_PF = 2.0
+ PERSIST_MIN_WR = 75.0
+ PASS_MEAN = 0.65
+ PASS_FLOOR_PER_SPLIT = 0.50
+-NULL_TRIPLES_PER_SPLIT = 400
++NULL_TRIPLES_PER_SPLIT = 120
++NULL_BATCH = 1
+ NULL_SEED = 20260724
+ ATTEST_FILE = '.wf_attest.jsonl'
+ 
+@@ -195,29 +196,52 @@ def assert_no_row_deletion(df, n_expected):
+     return True
+ 
+ 
+-def assert_oracle_causal(df, adaptive_full, compute_fn, train_last_bar, feature_keys, sample=6):
++def classify_threshold_keys(adaptive, structural_keys):
++    rolling = [k for k in adaptive if k not in structural_keys]
++    constant = [k for k in adaptive if k in structural_keys]
++    return rolling, constant
++
++
++def assert_oracle_causal(df, adaptive_full, compute_fn, train_last_bar, structural_keys):
++    t0 = time.time()
+     truncated = df.iloc[:train_last_bar + 1].copy()
+     ad_tr = compute_fn(truncated)
+-    checked = 0
++    rolling, constant = classify_threshold_keys(adaptive_full, set(structural_keys))
++    checked_rolling = 0
++    checked_constant = 0
+     mismatches = []
+-    for key in feature_keys:
+-        if key not in adaptive_full or key not in ad_tr:
++    for key in list(adaptive_full.keys()):
++        if key not in ad_tr:
+             continue
+         a = np.asarray(adaptive_full[key])[:train_last_bar + 1]
+         b = np.asarray(ad_tr[key])
+-        if a.shape != b.shape:
+-            mismatches.append((key, 'shape'))
+-        elif not np.allclose(a, b, equal_nan=True):
+-            mismatches.append((key, int(np.argmax(~np.isclose(a, b, equal_nan=True)))))
+-        checked += 1
+-        if checked >= sample:
+-            break
+-    return {'features_checked': checked, 'mismatches': len(mismatches),
+-            'detail': ';'.join(f'{k}@{v}' for k, v in mismatches),
++        same = a.shape == b.shape and np.array_equal(a, b)
++        if not same:
++            mismatches.append(str(key))
++        if key in set(structural_keys):
++            checked_constant += 1
++        else:
++            checked_rolling += 1
++    elapsed = time.time() - t0
++    return {'keys_total': len(adaptive_full),
++            'rolling_D_keys_checked': checked_rolling,
++            'rolling_D_keys_available': len(rolling),
++            'structural_constant_keys_checked': checked_constant,
++            'coverage': f'{checked_rolling} of {len(rolling)} rolling-D keys and '
++                        f'{checked_constant} of {len(constant)} structural-constant keys',
++            'equality': 'EXACT bitwise (np.array_equal); no tolerance, because a tolerance in a causality '
++                        'assertion is a place a future leak could hide',
++            'mismatches': len(mismatches), 'detail': ';'.join(mismatches[:12]),
+             'causal': len(mismatches) == 0,
+-            'meaning': 'threshold values over the training prefix are identical whether computed on the full '
+-                       'frame or on the truncated prefix; mechanism D therefore cannot see the test segment, '
+-                       'and masking after a full-frame computation is not a leak'}
++            'seconds': round(elapsed, 2),
++            'meaning': 'threshold values over the training prefix are bitwise identical whether computed on the '
++                       'full frame or on the truncated prefix; mechanism D therefore cannot see the test segment, '
++                       'and masking after a full-frame computation is not a leak',
++            'note': 'ALL keys are checked, not a sample. The structural constants (VWAP_Z, OR_Position) are '
++                    'causally trivial because a constant is identical on any prefix, so they are counted '
++                    'SEPARATELY and never presented as evidence of rolling-threshold causality. The cost is '
++                    'dominated by the single truncated recomputation, which is paid regardless of how many keys '
++                    'are compared, so full coverage is effectively free and must not be reduced for speed.'}
+ 
+ 
+ def require_h3_evaluable(split_index, direction_results):
+@@ -328,6 +352,75 @@ def random_triple_null(pool_keys, rng, n_triples=NULL_TRIPLES_PER_SPLIT, arity=3
+     return out
+ 
+ 
++def triples_to_signals(triples, rng):
++    rows = []
++    for t in triples:
++        parts = []
++        ok = True
++        for c in t:
++            if ':' not in c:
++                ok = False
++                break
++            f, th = c.rsplit(':', 1)
++            parts.append((f, th))
++        if not ok or len(parts) != 3:
++            continue
++        rows.append({'feat_1': parts[0][0], 'thresh_1': parts[0][1],
++                     'feat_2': parts[1][0], 'thresh_2': parts[1][1],
++                     'feat_3': parts[2][0], 'thresh_3': parts[2][1],
++                     'direction': 'LONG' if rng.integers(0, 2) == 0 else 'SHORT'})
++    return pd.DataFrame(rows)
++
++
++def bar_mask(n_bars, first_bar, last_bar, warmup):
++    m = np.zeros(n_bars, dtype=bool)
++    m[max(first_bar, warmup):last_bar + 1] = True
++    return m
++
++
++def score_null_arm(df, pool_keys, adaptive, structural, warmup, split, guard, run_portfolio,
++                   n_triples=NULL_TRIPLES_PER_SPLIT, seed=NULL_SEED):
++    rng = np.random.default_rng(seed + int(split['split_index']))
++    triples = random_triple_null(pool_keys, rng, n_triples=n_triples)
++    sig_all = triples_to_signals(triples, rng)
++    n = len(df)
++    train_mask = bar_mask(n, 0, split['train_last_bar'], warmup)
++    train_rows = []
++    for i in range(len(sig_all)):
++        one = sig_all.iloc[[i]]
++        td = run_portfolio(df, one, mask_window=train_mask, adaptive=adaptive,
++                           structural=structural, warmup=warmup, verbose=False)
++        train_rows.append({'entity': f'NULL_{i:04d}', 'signal_name': f'NULL_{i:04d}',
++                           'pnl': td['pnl'].values if len(td) else np.array([])})
++    test_slice = guard.touch(df)
++    test_lo = int(test_slice.index[0])
++    test_hi = int(test_slice.index[-1])
++    test_mask = bar_mask(n, test_lo, test_hi, warmup)
++    test_rows = []
++    for i in range(len(sig_all)):
++        one = sig_all.iloc[[i]]
++        td = run_portfolio(df, one, mask_window=test_mask, adaptive=adaptive,
++                           structural=structural, warmup=warmup, verbose=False)
++        test_rows.append({'entity': f'NULL_{i:04d}', 'pnl': td['pnl'].values if len(td) else np.array([])})
++    rows = []
++    for a, b in zip(train_rows, test_rows):
++        tr = persistence_flags(a['pnl'])
++        te = persistence_flags(b['pnl'])
++        rows.append({'split_index': split['split_index'], 'entity': a['entity'],
++                     'train_trades': int(len(a['pnl'])), 'test_trades': int(len(b['pnl'])),
++                     'train_net': round(tr['net'], 1), 'train_PF': round(tr['PF'], 3), 'train_WR': round(tr['WR'], 1),
++                     'test_net': round(te['net'], 1), 'test_PF': round(te['PF'], 3), 'test_WR': round(te['WR'], 1),
++                     'train_passes': tr['passes'], 'test_passes': te['passes'],
++                     'persists': bool(tr['passes'] and te['passes'])})
++    frame = pd.DataFrame(rows)
++    rate, k, m = persistence_rate(frame) if len(frame) else (np.nan, 0, 0)
++    return frame, {'split_index': split['split_index'], 'triples_generated': int(len(sig_all)),
++                   'train_qualifiers': m, 'persisted': k,
++                   'null_persistence_rate': round(rate, 4) if rate == rate else np.nan,
++                   'seed': seed + int(split['split_index']), 'batch_size': NULL_BATCH,
++                   'test_bar_range': f'{test_lo}-{test_hi}'}
++
++
+ def write_attestation(out_dir, record):
+     os.makedirs(out_dir, exist_ok=True)
+     path = os.path.join(out_dir, ATTEST_FILE)
+@@ -376,38 +469,78 @@ def build_attestation_record(run_id, code_shas, split_def_sha, input_sha, split,
+             'embargo_bar_range': [split['embargo_first_bar'], split['embargo_last_bar']]}
+ 
+ 
+-def rejection_checks(df, n_expected, splits, meta, adaptive_causal, guards):
++def rejection_checks(df, n_expected, splits, meta, adaptive_causal, guards,
++                     per_split_frame=None, attest_trail=None, pass_frame=None):
+     checks = []
+     checks.append({'item': 1, 'rule': 'a fixed book re-scored per split instead of the funnel re-run',
+                    'status': 'ENFORCED BY CONSTRUCTION' if meta.get('funnel_rerun') else 'UNEXERCISABLE PENDING S3',
++                   'basis': 'run state',
+                    'detail': meta.get('funnel_detail', 'the funnel requires a candidate pool that does not exist')})
+     checks.append({'item': 2, 'rule': 'any parameter chosen with sight of a test segment',
+                    'status': 'PASS' if adaptive_causal.get('causal') else 'FAIL',
++                   'basis': f"computed: {adaptive_causal.get('coverage', '')}, {adaptive_causal.get('mismatches')} mismatches",
+                    'detail': adaptive_causal.get('meaning', '')})
+     checks.append({'item': 3, 'rule': 'discovery run across the full series and split afterwards',
+                    'status': 'ENFORCED BY CONSTRUCTION' if meta.get('funnel_rerun') else 'UNEXERCISABLE PENDING S3',
++                   'basis': 'run state',
+                    'detail': 'every per-segment derivation takes an explicit training bar range'})
+-    ok_emb = all(s['embargo_bars'] >= EMBARGO_BARS and s['test_first_bar'] > s['embargo_last_bar'] for s in splits) if splits else False
++    ok_emb = bool(splits) and all(s['embargo_bars'] >= EMBARGO_BARS and s['test_first_bar'] > s['embargo_last_bar']
++                                  for s in splits)
++    gaps = [s['test_first_bar'] - s['train_last_bar'] for s in splits]
+     checks.append({'item': 4, 'rule': 'omitting the embargo or setting it shorter than the longest forward label',
+                    'status': 'PASS' if ok_emb else 'FAIL',
+-                   'detail': f'embargo {EMBARGO_BARS} bars >= 1440; longest forward label in use is the thrust window W=60 bars'})
++                   'basis': f'computed: min realised gap {min(gaps) if gaps else 0} bars vs required {EMBARGO_BARS}',
++                   'detail': 'longest forward-looking label in use is the thrust window W=60 bars'})
++    idx_expected = sorted(s['split_index'] for s in splits)
++    if per_split_frame is not None and len(per_split_frame):
++        idx_present = sorted(int(x) for x in per_split_frame['split_index'].tolist())
++        rows_ok = idx_present == idx_expected
++    else:
++        idx_present = []
++        rows_ok = False
++    agg_ok = True
++    if pass_frame is not None and len(pass_frame):
++        declared = int(pass_frame['splits_derived'].iloc[0]) if 'splits_derived' in pass_frame.columns else -1
++        agg_ok = declared == len(idx_expected)
+     checks.append({'item': 5, 'rule': 'reporting the best split or the mean without per-split values',
+-                   'status': 'PASS', 'detail': 'every derived split is emitted as its own row'})
++                   'status': 'PASS' if (rows_ok and agg_ok) else 'FAIL',
++                   'basis': f'computed from the emitted artifact: per-split rows {idx_present} vs derived '
++                            f'{idx_expected}; aggregate declares {len(idx_expected)} splits',
++                   'detail': 'every derived split is emitted as its own row and no aggregate is reported without them'})
++    if attest_trail is not None and len(attest_trail) and 'split_index' in attest_trail.columns:
++        trail_idx = sorted(set(int(x) for x in attest_trail['split_index'].tolist()))
++        trail_ok = all(i in trail_idx for i in idx_expected)
++        trail_basis = f'computed: trail holds {len(attest_trail)} records covering split indices {trail_idx}'
++    else:
++        trail_ok = False
++        trail_basis = 'computed: no attestation trail found'
+     checks.append({'item': 6, 'rule': 're-running a failed split after adjustment',
+-                   'status': 'ENFORCED BY ATTESTATION', 'detail': 'append-only trail; repeats reported not blocked'})
++                   'status': 'PASS' if trail_ok else 'FAIL',
++                   'basis': trail_basis,
++                   'detail': 'append-only trail written BEFORE any test touch; repeats reported not blocked'})
+     checks.append({'item': 7, 'rule': 'carrying the 27% null from the record',
+                    'status': 'ENFORCED BY CONSTRUCTION' if meta.get('null_per_split') else 'UNEXERCISABLE PENDING S3',
+-                   'detail': 'the null is regenerated inside each split and scored in the same single test pass'})
++                   'basis': 'run state',
++                   'detail': meta.get('null_detail', 'the null is regenerated inside each split and scored in the '
++                                                     'same single test pass')})
+     checks.append({'item': 8, 'rule': 'deleting rows anywhere to construct a segment',
+                    'status': 'PASS' if len(df) == n_expected else 'FAIL',
+-                   'detail': f'row count {len(df)} unchanged; segments are index ranges over the intact series'})
++                   'basis': f'computed: row count {len(df)} vs expected {n_expected}',
++                   'detail': 'segments are index ranges over the intact series; the oracle receives the full frame'})
+     second = sum(1 for g in guards if g.touch_count > 1)
++    touched = sum(1 for g in guards if g.consumed)
+     checks.append({'item': 9, 'rule': 'touching a test segment more than once',
+                    'status': 'PASS' if second == 0 else 'FAIL',
+-                   'detail': f'{second} guards recorded a second touch; TestSegmentGuard raises SecondTouchError'})
+-    below = [s['split_index'] for s in splits if s['train_days'] < MIN_TRAIN_DAYS or s['train_month_buckets'] < MIN_MONTH_BUCKETS]
++                   'basis': f'computed from guard state: {touched} guards consumed, {second} recorded a second touch',
++                   'detail': 'TestSegmentGuard raises SecondTouchError on a second request and still increments '
++                             'touch_count so the attempt remains visible'})
++    below = [s['split_index'] for s in splits
++             if s['train_days'] < MIN_TRAIN_DAYS or s['train_month_buckets'] < MIN_MONTH_BUCKETS]
+     checks.append({'item': 10, 'rule': 'shortening a training segment below the floor to fit a split count',
+                    'status': 'PASS' if not below else 'FAIL',
++                   'basis': f'computed: training segments {[s["train_days"] for s in splits]} days vs floor '
++                            f'{MIN_TRAIN_DAYS}; buckets {[s["train_month_buckets"] for s in splits]} vs floor '
++                            f'{MIN_MONTH_BUCKETS}',
+                    'detail': f'splits below floor: {below}' if below else 'every training segment meets the floor'})
+     return pd.DataFrame(checks)
+ 
+diff --git a/dot_master_discovery/master.py b/dot_master_discovery/master.py
+index 33a29d4..3a651b2 100644
+--- a/dot_master_discovery/master.py
++++ b/dot_master_discovery/master.py
+@@ -887,13 +887,20 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
+         f'embargo = {wfs.EMBARGO_BARS} bars stated as a BAR COUNT, not a session count: the measured median session '
+         f'is 1,365 bars, so a session reading would embargo fewer bars than one full trading day',
+         'scheme is ANCHORED: each training segment strictly contains the previous, so the floor binds only on the first',
+-        'NO ROW IS DELETED: segments are index ranges over the intact series and the oracle receives the full frame'])
++        'NO ROW IS DELETED: segments are index ranges over the intact series and the oracle receives the full frame',
++        'RECORDED LIMITATION — ATTESTATION SCOPE: repeat detection compares records within ONE output directory. A '
++        'run started against a FRESH --out directory begins with a clean trail and its repeats are not detected. No '
++        'in-process mechanism can bind an operator who deliberately starts elsewhere; the trail catches careless and '
++        'accidental repeats, which is its purpose, and the Auditor verifies trail length against reported splits.',
++        'RECORDED LIMITATION — GUARD SCOPE: TestSegmentGuard enforces the single touch on the SANCTIONED path. It '
++        'does not make the test bar range unreachable — unrelated code could slice those indices directly. The guard '
++        'is discipline on the intended route, not an access control.'])
+     attempts = pd.DataFrame(meta['attempts'])
+     _write_with_header(os.path.join(out, 'wf_split_derivation_attempts.csv'), attempts, [
+         'DOT S5C spec I.1 derivation trace — the floor being applied, not just the answer',
+         f'dataset_rows={attest["rows"]} segment_floor_days={wfs.MIN_TRAIN_DAYS} floor_buckets={wfs.MIN_MONTH_BUCKETS}'])
+-    ad_keys = list(ad.keys())[:8]
+-    causal = wfs.assert_oracle_causal(df, ad, dt_compute(), splits[0]['train_last_bar'], ad_keys)
++    struct_keys = dt_structural_keys()
++    causal = wfs.assert_oracle_causal(df, ad, dt_compute(), splits[0]['train_last_bar'], struct_keys)
+     U = cp.eligible_universe(df, w)
+     bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
+     sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path))
+@@ -905,10 +912,15 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
+     for s in splits:
+         tr = np.zeros(n0, dtype=bool)
+         tr[:s['train_last_bar'] + 1] = True
+-        cz = wfs.assert_oracle_causal(df, ad, dt_compute(), s['train_last_bar'], ad_keys)
++        cz = wfs.assert_oracle_causal(df, ad, dt_compute(), s['train_last_bar'], struct_keys)
+         causal_rows.append({'split_index': s['split_index'], 'train_last_bar': s['train_last_bar'],
+-                            'features_checked': cz['features_checked'], 'mismatches': cz['mismatches'],
+-                            'causal': cz['causal'], 'meaning': cz['meaning']})
++                            'keys_total': cz['keys_total'],
++                            'rolling_D_keys_checked': cz['rolling_D_keys_checked'],
++                            'rolling_D_keys_available': cz['rolling_D_keys_available'],
++                            'structural_constant_keys_checked': cz['structural_constant_keys_checked'],
++                            'coverage': cz['coverage'], 'equality': cz['equality'],
++                            'mismatches': cz['mismatches'], 'causal': cz['causal'],
++                            'meaning': cz['meaning'], 'note': cz['note']})
+         Utr = U & tr
+         hyg, dead, canon, live = sel.vocabulary_hygiene(pool, Utr, f"split{s['split_index']}")
+         sub = bk[bk['entry_bar'] <= s['train_last_bar']]
+@@ -953,30 +965,83 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
+         'H.3.1: buckets are evaluated WITHIN direction; a thin direction is reported UNEVALUABLE and is NEITHER '
+         'passed NOR culled.',
+         'below_floor_majority_flag TRUE means more than half the pair space sits below MIN_SHARED, so TailDep is not '
+-        'meaningfully binding in that segment and FailConc plus the absolute survival bound carry the decision.'])
++        'meaningfully binding in that segment and FailConc plus the absolute survival bound carry the decision.',
++        'RECORDED CONSEQUENCE — DO NOT OVER-READ AN EARLY-SPLIT RESULT: splits 0 and 1 fire this flag (retention '
++        '17.7% and 33.0%), so they test a WEAKER CONSTRAINT SET than split 2. A pass in an early split is evidence '
++        'about FailConc and absolute survival, NOT about tail dependence. The TailDep constraint only becomes '
++        'meaningfully binding once retention rises, which on this dataset happens at split 2 (51.3%).'])
+     _write_with_header(os.path.join(out, 'wf_oracle_causality.csv'), pd.DataFrame(causal_rows), [
+         'DOT S5C spec I.4 item 2 — the anti-leak assertion for the oracle',
+         f'dataset_rows={attest["rows"]}',
+         'Thresholds are computed ONCE on the FULL frame because the oracle must never receive a row-deleted frame.',
+         'This assertion proves that is not a leak: for each split, threshold values over the training prefix are '
+         'recomputed on a TRUNCATED frame ending at train_last_bar and compared. Zero mismatches means mechanism D '
+-        'is causal and cannot see the test segment, so masking after a full-frame computation is sound.'])
++        'is causal and cannot see the test segment, so masking after a full-frame computation is sound.',
++        'COVERAGE IS PART OF THE FINDING: ALL keys are compared, split into rolling-D and structural-constant '
++        'counts. The structural constants are causally trivial (a constant is identical on any prefix) and are '
++        'never presented as evidence of rolling-threshold causality. A previous revision sampled the head of the '
++        'threshold dict, which selected the four structural constants plus two rolling keys, so it tested 2 of 176 '
++        'rolling thresholds while reporting 6 features; that sample would have passed on a dataset where every '
++        'rolling threshold leaked.',
++        'RUNTIME COST, STATED SO NOBODY REVERTS IT FOR SPEED: 6 to 11 seconds per split on the reference machine, '
++        'rising with training-segment length. The cost is dominated by the ONE truncated recomputation per split, '
++        'which is paid regardless of how many keys are compared, so full coverage is effectively free and must not '
++        'be reduced to a sample.',
++        'Wall-clock timing is deliberately NOT emitted, as a column or interpolated into this header, because a '
++        'varying value would break the byte-level determinism of this artifact.'])
+     code_shas = {'wf_selection.py': _sha_full(os.path.join(_ENGINE, 'wf_selection.py')),
+                  'selection.py': _sha_full(os.path.join(_ENGINE, 'selection.py'))}
+     sdef = wfs.split_definition_sha(splits, meta)
+     run_id = f'{input_sha}-{sdef[:8]}'
+     guards = []
++    null_frames = []
++    null_summary = []
++    pool_keys = sorted(pool.keys())
+     for s in splits:
+         rec = wfs.build_attestation_record(run_id, code_shas, sdef, input_sha, s, out)
+         wfs.write_attestation(out, rec)
+-        guards.append(wfs.TestSegmentGuard(s['split_index'], s['test_first_bar'], s['test_last_bar']))
++        g = wfs.TestSegmentGuard(s['split_index'], s['test_first_bar'], s['test_last_bar'])
++        guards.append(g)
++        nf, ns = wfs.score_null_arm(df, pool_keys, ad, st, w, s, g, engine.run_portfolio)
++        null_frames.append(nf)
++        null_summary.append(ns)
++    nulls = pd.concat(null_frames, ignore_index=True) if null_frames else pd.DataFrame()
++    nsum = pd.DataFrame(null_summary)
++    if len(nulls):
++        _write_with_header(os.path.join(out, 'wf_null_arm_entities.csv'), nulls, [
++            'DOT S5C spec I.3 random-triple NULL ARM, per split — THIS IS A MEASUREMENT, NOT A PASS CRITERION',
++            f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++            f'oracle_sha256_12={oracle_sha}',
++            'Random triples are drawn from the existing 249-condition pool; NO S3 output is required, so this',
++            'violates no rejection item: it is not the fixed book (item 1), not full-series discovery (item 3),',
++            'and not the 27% figure carried from the record (item 7) — the null is regenerated inside each split.',
++            'Persistence is measured exactly as the record measures it: net>0, PF>=2, WR>=75 in BOTH train and test.',
++            'Each triple is scored STANDALONE (batch size 1) so the 6-lot jar cannot couple the null entities.',
++            'Scored on the test segment inside the SINGLE sanctioned TestSegmentGuard touch.',
++            'THE PASS CRITERION REMAINS UNEVALUABLE: it requires the SELECTION arm, which requires a candidate pool',
++            'that S3 has never produced. A null baseline is the denominator of that comparison, never the result.'])
++        _write_with_header(os.path.join(out, 'wf_null_arm_summary.csv'), nsum, [
++            'DOT S5C spec I.3 null-arm per-split summary — MEASUREMENT ONLY, NOT A WALK-FORWARD RESULT',
++            f'dataset_rows={attest["rows"]} triples_per_split={wfs.NULL_TRIPLES_PER_SPLIT} '
++            f'batch_size={wfs.NULL_BATCH} base_seed={wfs.NULL_SEED}',
++            'RNG SEEDING IS NOW REAL, NOT VACUOUS: before this arm ran, wf_selection instantiated no RNG at all and '
++            '"every RNG seeded" was vacuously true. The null draw uses np.random.default_rng(base_seed + split_index) '
++            'and the direction assignment draws from the same generator, so the whole arm is reproducible.',
++            'seed per split = base_seed + split_index, so the draw is reproducible and split-specific.',
++            'null_persistence_rate = persisted / train_qualifiers; entities failing the train bar are excluded',
++            'from the denominator, matching how the record computes its 27% baseline.'])
+     trail = wfs.read_attestation(out)
+     repeats, n_rep = wfs.detect_repeats(trail)
+-    meta_checks = {'funnel_rerun': False, 'null_per_split': False,
++    meta_checks = {'funnel_rerun': False, 'null_per_split': True,
++                   'null_detail': f'the random-triple null is regenerated inside each split from the '
++                                  f'{len(pool_keys)}-condition pool and scored in the same single test pass; '
++                                  f'the record 27% figure is never carried',
+                    'funnel_detail': 'S3 discovery has never run, so no candidate pool exists and the funnel cannot '
+                                     'be re-run per split; the mechanics are built and the criterion is unexercisable'}
+     wfs.assert_no_row_deletion(df, n0)
+-    rej = wfs.rejection_checks(df, n0, splits, meta_checks, causal, guards)
++    pc_pre = pd.DataFrame([{'splits_derived': len(splits)}])
++    rej = wfs.rejection_checks(df, n0, splits, meta_checks, causal, guards,
++                               per_split_frame=seg, attest_trail=trail, pass_frame=pc_pre)
+     _write_with_header(os.path.join(out, 'wf_rejection_checks.csv'), rej, [
+         'DOT S5C spec I.4 rejection list, implemented as executable checks rather than conventions',
+         f'dataset_rows={attest["rows"]} splits={len(splits)}',
+@@ -998,10 +1063,14 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
+         'A FAIL IS A LEGITIMATE RESULT and would be reported as one. No bar is lowered to obtain a pass.'])
+     print(f'  splits derived {len(splits)} (floor: >={wfs.MIN_TRAIN_DAYS}d and >={wfs.MIN_MONTH_BUCKETS} buckets) | '
+           f'embargo {wfs.EMBARGO_BARS} bars | oracle causal {all(c["causal"] for c in causal_rows)}')
++    if len(nsum):
++        print('  null arm (MEASUREMENT, not a pass criterion): ' +
++              ' | '.join(f"split {int(r['split_index'])} {r['persisted']}/{r['train_qualifiers']}"
++                         f"={r['null_persistence_rate']}" for _i, r in nsum.iterrows()))
+     print(f'  attestation records {len(trail)} (repeat groups {len(repeats)}) | pass criterion: {verdict["verdict"]}')
+     mark_done(out, 'S5C', {'input_sha': input_sha, 'splits': len(splits)})
+     return {'splits': sp, 'segments': seg, 'rejection': rej, 'pass': pc, 'trail': trail,
+-            'repeats': repeats, 'meta': meta}
++            'repeats': repeats, 'meta': meta, 'null_summary': nsum}
+ 
+ 
+ def _sha_full(path):
+@@ -1014,6 +1083,11 @@ def dt_compute():
+     return _dt.compute_adaptive_thresholds
+ 
+ 
++def dt_structural_keys():
++    import dots_thresholds as _dt
++    return set(_dt._STRUCTURAL.keys())
++
++
+ # ── S8B CLUSTER-PARTICIPATION PROFILER ──
+ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, input_sha, attest):
+     import cluster_profiler as cp
+-- 
+2.43.0
+

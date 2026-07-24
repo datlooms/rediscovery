@@ -1,0 +1,7 @@
+# DOT S5C spec I.3 pass criterion
+# dataset_rows=177251 splits_derived=3
+# CRITERION: signal-level persistence measured as the record measures it (net>0, PF>=2, WR>=75 in BOTH train and test), mean over derived splits >= 0.65 with NO single split below 0.50, against a random-triple null REGENERATED PER SPLIT and scored in the SAME single test pass.
+# VERDICT UNEVALUABLE: producing a persistence figure requires re-running the funnel per split, which requires a candidate pool. S3 discovery has never run. Re-scoring the fixed incumbent book across splits would be rejection-list item 1 and is NOT done here — a number produced by the prohibited path is worse than none.
+# A FAIL IS A LEGITIMATE RESULT and would be reported as one. No bar is lowered to obtain a pass.
+mean_persistence,min_split,splits,verdict,target_mean,target_floor,note,splits_derived,attestation_records,attestation_repeat_groups,attestation_repeat_records
+,,0,UNEVALUABLE,0.65,0.5,no split produced an evaluable persistence rate,3,3,0,0

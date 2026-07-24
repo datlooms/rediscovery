@@ -1,0 +1,10 @@
+# DOT S5C spec I.3 null-arm per-split summary — MEASUREMENT ONLY, NOT A WALK-FORWARD RESULT
+# dataset_rows=177251 triples_per_split=120 batch_size=1 base_seed=20260724
+# RNG SEEDING IS NOW REAL, NOT VACUOUS: before this arm ran, wf_selection instantiated no RNG at all and "every RNG seeded" was vacuously true. The null draw uses np.random.default_rng(base_seed + split_index) and the direction assignment draws from the same generator, so the whole arm is reproducible.
+# seed per split = base_seed + split_index, so the draw is reproducible and split-specific.
+# null_persistence_rate = persisted / train_qualifiers; entities failing the train bar are excluded
+# from the denominator, matching how the record computes its 27% baseline.
+split_index,triples_generated,train_qualifiers,persisted,null_persistence_rate,seed,batch_size,test_bar_range
+0,120,16,6,0.375,20260724,1,89643-118283
+1,120,16,7,0.4375,20260725,1,121014-147853
+2,120,16,5,0.3125,20260726,1,150584-177250

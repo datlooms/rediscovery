@@ -1,0 +1,14 @@
+# DOT S5C spec I.4 rejection list, implemented as executable checks rather than conventions
+# dataset_rows=177251 splits=3
+# UNEXERCISABLE PENDING S3 marks a check whose subject does not exist yet, not a check that passed.
+item,rule,status,basis,detail
+1,a fixed book re-scored per split instead of the funnel re-run,UNEXERCISABLE PENDING S3,run state,"S3 discovery has never run, so no candidate pool exists and the funnel cannot be re-run per split; the mechanics are built and the criterion is unexercisable"
+2,any parameter chosen with sight of a test segment,PASS,"computed: 176 of 176 rolling-D keys and 4 of 4 structural-constant keys, 0 mismatches","threshold values over the training prefix are bitwise identical whether computed on the full frame or on the truncated prefix; mechanism D therefore cannot see the test segment, and masking after a full-frame computation is not a leak"
+3,discovery run across the full series and split afterwards,UNEXERCISABLE PENDING S3,run state,every per-segment derivation takes an explicit training bar range
+4,omitting the embargo or setting it shorter than the longest forward label,PASS,computed: min realised gap 2730 bars vs required 1440,longest forward-looking label in use is the thrust window W=60 bars
+5,reporting the best split or the mean without per-split values,PASS,"computed from the emitted artifact: per-split rows [0, 1, 2] vs derived [0, 1, 2]; aggregate declares 3 splits",every derived split is emitted as its own row and no aggregate is reported without them
+6,re-running a failed split after adjustment,PASS,"computed: trail holds 3 records covering split indices [0, 1, 2]",append-only trail written BEFORE any test touch; repeats reported not blocked
+7,carrying the 27% null from the record,ENFORCED BY CONSTRUCTION,run state,the random-triple null is regenerated inside each split from the 249-condition pool and scored in the same single test pass; the record 27% figure is never carried
+8,deleting rows anywhere to construct a segment,PASS,computed: row count 177251 vs expected 177251,segments are index ranges over the intact series; the oracle receives the full frame
+9,touching a test segment more than once,PASS,"computed from guard state: 3 guards consumed, 0 recorded a second touch",TestSegmentGuard raises SecondTouchError on a second request and still increments touch_count so the attempt remains visible
+10,shortening a training segment below the floor to fit a split count,PASS,"computed: training segments [60, 83, 105] days vs floor 60; buckets [4, 5, 6] vs floor 3",every training segment meets the floor

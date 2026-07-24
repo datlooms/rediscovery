@@ -1,9 +1,0 @@
-# DOT S5B spec H.3 / H.3.1 regime-conditional persistence — PROPERTY OF THE BOOK
-# dataset_rows=177251 segment=2026.01..2026.07
-# RULE not literal: calendar month, whatever count the segment contains; positive in all but at most one;
-# MINIMUM 3 BUCKETS or the criterion is UNEVALUABLE and the build fails loudly rather than passing silently.
-# H.3.1: buckets are evaluated WITHIN direction. A thin short sample is reported UNEVALUABLE and the signal
-# is NEITHER passed NOR culled on that basis. No rule may remove the last short signal without a named line.
-buckets,positive,evaluable,verdict,rule,per_bucket,direction,trades,population,directional_protection
-7,7,True,PASS,calendar month; positive in all but at most one; minimum 3 buckets,2026.01:3701.9;2026.02:11270.7;2026.03:13929.6;2026.04:9737.6;2026.05:10148.6;2026.06:10438.6;2026.07:5946.9,LONG,1983,BOOK,"H.3.1: buckets evaluated WITHIN direction; thin samples reported UNEVALUABLE, never culled"
-7,6,True,PASS,calendar month; positive in all but at most one; minimum 3 buckets,2026.01:483.9;2026.02:3528.7;2026.03:2975.5;2026.04:1739.1;2026.05:1823.7;2026.06:2067.4;2026.07:-553.5,SHORT,695,BOOK,"H.3.1: buckets evaluated WITHIN direction; thin samples reported UNEVALUABLE, never culled"

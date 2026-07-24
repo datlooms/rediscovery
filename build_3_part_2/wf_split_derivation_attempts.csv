@@ -1,4 +1,0 @@
-# DOT S5C spec I.1 derivation trace — the floor being applied, not just the answer
-# dataset_rows=177251 segment_floor_days=60 floor_buckets=3
-n,result
-3,ACCEPTED

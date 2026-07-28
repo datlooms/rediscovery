@@ -2,8 +2,8 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
-import shutil
 import sys
 import time
 
@@ -36,7 +36,7 @@ FOLD_BASIS_NOTE = ('folds and OOS are PROPORTIONAL, never calendar. The loaded p
 OOS_MONTHS = ['2026.05', '2026.06']
 OOS_LEGACY_NOTE = 'LEGACY DIAGNOSTIC, STALE: fixed calendar months, neither out-of-sample nor segment-relative on a stitched series; not a selection input (spec B.1). oos_rel_* are the data-relative counterpart.'
 OOS_REL_N_MONTHS = 2
-STAGES = ['S0', 'S1', 'S2', 'S2B', 'S3', 'S3B', 'S4', 'S5', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
+STAGES = ['S0', 'S1', 'S2', 'S2B', 'S3', 'S3B', 'S4', 'S5', 'S5D', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
 FAMILIES = [
     ('F0', 'triple_convergence_and_d2ddir', 'committed'),
     ('F1', 'sequential_temporal', 'committed'),
@@ -54,7 +54,7 @@ FAMILIES = [
 ]
 
 
-from _packutil import sha12, _natkey, split_output
+from _packutil import sha12, _natkey
 
 
 def verify_sacred():
@@ -441,7 +441,7 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
               'nothing to score automatically: the deliverable is fourteen per-family catalogues '
               'holding every VALID signal, and NOTHING in this build chooses which of them to '
               'trade. Scoring happens when YOU compose a book and run it through:')
-        print('      python score_book.py --book <your_book.csv> --data <frame> --out <dir>')
+        print('      python score_book.py --book <your_book.csv> --data <frame> --out <dir>   (item 16, not yet built)')
         print('  That tool (item 16) applies the constraint machinery - TailDep, FailConc, mCVaR, '
               'absolute survival, union coverage - which are SET properties of an assembled book '
               'and have no per-signal value. Every catalogue states a book is UNSCORED until it '
@@ -836,6 +836,176 @@ def _no_constraint(_d, _ss):
     return True, ''
 
 
+def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
+    import catalogue as cat
+    import cluster_profiler as cp
+    import conviction as C
+    import selection as sel
+    import terrain as tr
+    import portfolio_simulation_engine as engine
+    import score_g
+    import numpy as np
+    oracle_sha = sha12(os.path.join(_ENGINE, 'dots_thresholds.py'))
+    print(f'  oracle dots_thresholds.py sha256 : {oracle_sha}')
+    cand = os.path.join(out, 'results', 'candidates.csv')
+    if not os.path.exists(cand):
+        print('  CATALOGUE: no candidates.csv - S3/S4/S5 have not produced a pool. NOT marking done.')
+        return None
+    cands = pd.read_csv(cand)
+    n = len(df)
+    bar_day = pd.Series(df['Time'].astype(str).values).str[:10].values
+    U = cp.eligible_universe(df, w)
+    W, K, E = cat.PINNED_CELL
+    fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, W, (K,), (E,))
+    ev = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, f'k{int(K*100)}')],
+                          thr[(ecol, f'e{int(E*100)}')], w)
+    cs = cp.build_cluster_set(n, ev, tr.CONTIGUOUS_TOLERANCE)
+    reach = cat.reachable_episodes(cs, df, w, U)
+    raw_tot = {d: int((cs['clusters']['dir'] == d).sum()) for d in (1, -1)}
+    print(f'  TERRAIN cell W={W} K=p{int(K*100)} E=p{int(E*100)} | MARKET | raw '
+          f'UP {raw_tot[1]} DOWN {raw_tot[-1]} | REACHABLE UP {len(reach[1])} '
+          f'({100.0*len(reach[1])/max(raw_tot[1],1):.2f}%) DOWN {len(reach[-1])} '
+          f'({100.0*len(reach[-1])/max(raw_tot[-1],1):.2f}%)')
+    hurst_hi = ad.get(('Hurst', 'hi'))
+    gate_ok = np.flatnonzero((df['Hurst'].values >= hurst_hi) if hurst_hi is not None
+                             else np.ones(n, dtype=bool)).astype(np.int64)
+    conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
+    per_family = {}
+    entries_by_id, dirs_by_id, fams_by_id = {}, {}, {}
+    for fam, g in cands.groupby('family'):
+        rows = []
+        null_pfs, null_rate = [], 0.0
+        for _i, cr in g.iterrows():
+            sig = str(cr['signal_def'])
+            dr = str(cr.get('direction', 'LONG')).upper()
+            sid = cat.signal_id(fam, sig, dr)
+            one = pd.DataFrame([{'trigger': fam, 'family': fam, 'direction': dr, 'signal_def': sig}])
+            try:
+                sg = score_g.build_book(df, pool, anchor, one, adaptive=ad, structural=st)
+                td = engine.run_portfolio(df, sg, adaptive=ad, structural=st, warmup=w,
+                                          verbose=False, conviction=conv)
+                td = td[~td['signal_name'].isin(cp.GAP_NAMES)]
+            except SystemExit:
+                continue
+            verdict, reason, stx = cat.evaluate_valid(td, bar_day)
+            d = 1 if dr == 'LONG' else -1
+            row = {'signal_id': sid, 'family': fam, 'signal_def': sig, 'direction': dr,
+                   'verdict': verdict, 'reason_code': reason}
+            row.update(stx)
+            if verdict == 'VALID':
+                bars = np.asarray(td['entry_bar'].values, dtype=np.int64)
+                entries_by_id[sid] = bars
+                dirs_by_id[sid] = d
+                fams_by_id[sid] = fam
+                tch = cat.touched_episodes(bars, d, cs)
+                tch_reach = [t for t in tch if t in reach[d]]
+                row['touched_episode_ids'] = ';'.join(str(x) for x in tch)
+                row['episodes_touched'] = len(tch)
+                row['coverage_pct_raw_terrain'] = round(100.0 * len(tch) / max(raw_tot[d], 1), 4)
+                row['coverage_pct_reachable'] = round(100.0 * len(tch_reach) / max(len(reach[d]), 1), 4)
+                row['terrain_cell'] = f'W{W}/K{int(K*100)}/E{int(E*100)}'
+                row.update(cat.segment_fold_stats(td))
+                row.update({f'gated_{k}': v for k, v in cat.gated_arm(td, gate_ok).items()})
+                row['gated_delta_net'] = (round(row['gated_net'] - stx.get('net', 0.0), 2)
+                                          if row['gated_net'] != '' else '')
+            rows.append(row)
+        fr = pd.DataFrame(rows)
+        if len(fr):
+            N_F = len(fr)
+            v = fr[fr['verdict'] == 'VALID']
+            pfs = [x for x in v.get('agg_pf', pd.Series(dtype=float)).tolist()
+                   if isinstance(x, (int, float)) and math.isfinite(x)]
+            null_pfs = sorted(pfs)
+            null_rate = (len(v) / float(N_F)) if N_F else 0.0
+            price = [cat.pricing_columns(r.get('agg_pf', float('nan')), N_F, null_rate, null_pfs)
+                     for _j, r in fr.iterrows()]
+            for k in price[0]:
+                fr[k] = [p[k] for p in price]
+            exc = pd.to_numeric(fr['pf_null_exceedance_pct'], errors='coerce').fillna(1.0).values
+            fr['q_value_BY_family'] = np.round(cat.benjamini_yekutieli(exc), 6)
+        per_family[fam] = fr
+    cat_dir = os.path.join(out, 'catalogues')
+    os.makedirs(cat_dir, exist_ok=True)
+    print('  CATALOGUE ROW COUNT PER FAMILY:')
+    for fam in sorted(per_family):
+        fr = per_family[fam]
+        path = os.path.join(cat_dir, f'catalogue_{fam}.csv')
+        _write_with_header(path, fr, [
+            f'DOT CATALOGUE - family {fam} - every signal VALID admits, nothing ranked or capped',
+            f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
+            f'oracle_sha256_12={oracle_sha}',
+            f'terrain cell W={W} K=p{int(K*100)} E=p{int(E*100)} | coverage emitted against BOTH '
+            f'denominators: raw terrain (UP {raw_tot[1]} / DOWN {raw_tot[-1]}, MARKET) and REACHABLE '
+            f'(UP {len(reach[1])} / DOWN {len(reach[-1])}, MARKET). REACHABLE IS PRIMARY.',
+            'per-signal statistics are PROPERTY OF THE BOOK; terrain and reachable are PROPERTY OF '
+            'THE MARKET.',
+            cat.CATALOGUE_HEADER_PRICING, cat.CATALOGUE_HEADER_UNSCORED,
+            'UNEVALUABLE rows are RETAINED with statistics blank and a reason_code. INVALID rows '
+            '(V2 survival breach) do not enter; their count is reported in the run log.'])
+        vc = fr['verdict'].value_counts().to_dict() if len(fr) else {}
+        print(f'    {fam:4} {len(fr):7} rows | {vc}')
+    unclaimed = []
+    spans = cat.episode_spans(cs)
+    claimed = {d: set() for d in (1, -1)}
+    for sid, bars in entries_by_id.items():
+        d = dirs_by_id[sid]
+        claimed[d].update(cat.touched_episodes(bars, d, cs))
+    for d, lab in ((1, 'UP'), (-1, 'DOWN')):
+        for eid in sorted(reach[d] - claimed[d]):
+            b0, b1, _dd = spans[eid]
+            unclaimed.append({'episode_id': eid, 'direction': lab, 'start_bar': b0, 'end_bar': b1,
+                              'duration_bars': b1 - b0 + 1,
+                              'displacement_pts': round(abs(float(df['Close'].values[min(b1 + W, n - 1)]
+                                                                 - df['Close'].values[b0])), 1),
+                              'est_hour_start': int(df['EST_Hour'].values[b0]),
+                              'n_conditions_firing': int(sum(1 for k in pool
+                                                             if pool[k][b0:b1 + 1].any())),
+                              'n_valid_triples_touching': 0,
+                              'population': 'MARKET'})
+    uf = pd.DataFrame(unclaimed)
+    _write_with_header(os.path.join(cat_dir, 'unclaimed_reachable.csv'), uf, [
+        'DOT item 6 - REACHABLE episodes no catalogue signal touches - PROPERTY OF THE MARKET',
+        f'dataset_rows={attest["rows"]} terrain cell W={W} K=p{int(K*100)} E=p{int(E*100)}',
+        'n_conditions_firing vs n_valid_triples_touching separates a SEARCH gap (many conditions '
+        'fire, no valid triple lands) from a GRAMMAR gap (few fire). Without both the set shows what '
+        'is unoccupied but not why.'])
+    print(f'  UNCLAIMED REACHABLE: {len(uf)} episodes '
+          f'(UP {int((uf["direction"] == "UP").sum()) if len(uf) else 0} / '
+          f'DOWN {int((uf["direction"] == "DOWN").sum()) if len(uf) else 0})')
+    ent = {d: [] for d in (1, -1)}
+    ids = {d: [] for d in (1, -1)}
+    for sid, bars in entries_by_id.items():
+        d = dirs_by_id[sid]
+        ent[d].extend(np.asarray(bars, dtype=np.int64).tolist())
+        ids[d].extend([sid] * len(bars))
+    cohort = cat.same_bar_cohort_table(ent, ids, fams_by_id)
+    _write_with_header(os.path.join(cat_dir, 'same_bar_cohort.csv'), cohort, [
+        'DOT item 11 - family composition of each bar as a CURVE OVER DEPTH - counts only',
+        f'dataset_rows={attest["rows"]}',
+        'Depth is DISTINCT SIGNALS on the same bar, per direction, never pooled (item 4). No P&L: '
+        'depth-3 has no discriminating power at pool scale and P&L needs a book.'])
+    allrows = pd.concat([f for f in per_family.values() if len(f)], ignore_index=True) \
+        if per_family else pd.DataFrame()
+    if len(allrows):
+        v = allrows[allrows['verdict'] == 'VALID'].copy()
+        for key, asc in (('agg_pf', False), ('EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF', True)):
+            if key not in v.columns:
+                continue
+            o = v.sort_values(key, ascending=asc)['signal_id'].tolist()
+            dc = cat.dilution_curve(o, entries_by_id, dirs_by_id, key)
+            _write_with_header(os.path.join(cat_dir, f'dilution_curve_{key}.csv'), dc, [
+                f'DOT item 12 - dilution curve, ranking key = {key}',
+                f'dataset_rows={attest["rows"]}',
+                'Admission is best-first over the WHOLE catalogue, not a top-ranked subset. The '
+                'curve is emitted under two keys because the stop-point differs by key, and the '
+                'gap between them is the overfit estimate. Counts only, no P&L.'])
+            print(f'  DILUTION CURVE ({key}): {len(dc)} admission steps')
+    mark_done(out, 'S5D', {'input_sha': input_sha,
+                           'families': len(per_family),
+                           'rows': int(sum(len(f) for f in per_family.values()))})
+    return {'per_family': per_family, 'unclaimed': uf, 'reach': reach, 'raw_tot': raw_tot}
+
+
 def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
     import cluster_profiler as cp
     import selection as sel
@@ -967,7 +1137,7 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
         if not sset:
             return 0.0
         bars = np.concatenate([ent_map[d][x] for x in sset])
-        v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT, sel.N_TOLERANCE)
+        v, _g = sel.depth_yield_direction(bars, tdays, sel.S_DEFAULT, sel.N_TOLERANCE)
         return v
 
     def _gain(d, selected, cid):
@@ -1119,7 +1289,7 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
             if not sset:
                 return 0.0
             bars = np.concatenate([cand_bars[d][x] for x in sset])
-            v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT,
+            v, _g = sel.depth_yield_direction(bars, tdays, sel.S_DEFAULT,
                                               sel.N_TOLERANCE)
             return v
 
@@ -1785,6 +1955,7 @@ def main():
 
     contenders = committed = profile = evidence = selection_state = wf_state = None
     terrain_state = None
+    catalogue_state = None
     run_all = only is None
     if run_all or only == 'S2B':
         print('\n[S2B] MARKET TERRAIN MAP')
@@ -1810,6 +1981,9 @@ def main():
     if (run_all and discover) or only == 'S6':
         print('\n[S6] FULL-FIELD SCORING (REGEN fresh)')
         s6_regen(out, input_sha)
+    if run_all or only == 'S5D':
+        print('\n[S5D] CATALOGUE - fourteen per-family books, every VALID signal')
+        catalogue_state = s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest)
     if run_all or only == 'S5B':
         print('\n[S5B] SELECTION LAYER')
         selection_state = s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest)

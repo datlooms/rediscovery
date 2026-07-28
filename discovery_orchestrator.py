@@ -46,7 +46,6 @@ import rolling_leadlag as f11
 # ═══════════════════════════════════════════════════════════════
 
 RESULTS_DIR = os.environ.get('DOT_RESULTS_DIR', "discovery_results")
-_LEGACY_RESULTS_DIR = "discovery_results"
 SCHEMA = ['family', 'script', 'signal_def', 'direction', 'd2d_mode', 'trades', 'WR',
           'agg_pf', 'worst_day_usd', 'hard_stop_days', 'folds_plus', 'min_fold_pf',
           'spread_pf', 'survival']

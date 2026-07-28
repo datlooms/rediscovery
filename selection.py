@@ -269,23 +269,71 @@ def cofire_book_all_pairs_DIAGNOSTIC(M):
     return float(off.mean())
 
 
-def clusters_from_entries(bars, n_tol):
-    bars = np.sort(np.asarray(bars, dtype=np.int64))
-    out = []
+def clusters_from_entries(bars, n_tol, signal_ids=None):
+    """Item 4: a run's size is the count of DISTINCT signals in it, not entry rows.
+
+    The same signal re-firing inside a tolerance window was previously counted as
+    several agreeing signals. Measured per direction the inflation is 1.8% at
+    N=1, 15.4% at N=5 and 26.1% at N=30. Passing signal_ids returns distinct
+    counts; omitting it preserves the entry-row count for callers that genuinely
+    want occupancy.
+
+    RUNS ARE BUILT PER DIRECTION BY THE CALLER, NEVER POOLED. Pooling long and
+    short entries into one run gives 27.6% at N=30 and shifts every downstream
+    count in items 11 and 12.
+    """
+    bars = np.asarray(bars, dtype=np.int64)
     if len(bars) == 0:
-        return out
+        return []
+    order = np.argsort(bars, kind='stable')
+    bars = bars[order]
+    ids = None if signal_ids is None else np.asarray(signal_ids, dtype=object)[order]
+    out = []
     start = 0
     for i in range(1, len(bars) + 1):
         if i == len(bars) or (bars[i] - bars[i - 1]) > n_tol:
-            out.append(i - start)
+            out.append((i - start) if ids is None else len(set(ids[start:i].tolist())))
             start = i
     return out
 
 
-def depth_yield_direction(entry_bars_d, n_signals_d, traded_day_count, S, n_tol):
+def cluster_runs(bars, n_tol, signal_ids):
+    """Same partition as clusters_from_entries, returning the runs themselves.
+
+    Items 5, 7, 11 and 12 need the member bars and the distinct-signal set, not
+    just the size. One partition function, so a run means the same thing to
+    every consumer.
+    """
+    bars = np.asarray(bars, dtype=np.int64)
+    if len(bars) == 0:
+        return []
+    order = np.argsort(bars, kind='stable')
+    bars = bars[order]
+    ids = np.asarray(signal_ids, dtype=object)[order]
+    runs = []
+    start = 0
+    for i in range(1, len(bars) + 1):
+        if i == len(bars) or (bars[i] - bars[i - 1]) > n_tol:
+            runs.append({'b0': int(bars[start]), 'b1': int(bars[i - 1]),
+                         'entry_rows': int(i - start),
+                         'distinct_signals': len(set(ids[start:i].tolist())),
+                         'members': sorted(set(ids[start:i].tolist()))})
+            start = i
+    return runs
+
+
+def same_signal_refire_rate(bars, n_tol, signal_ids):
+    """The inflation item 4 removes: 1 - distinct/entry_rows, per direction."""
+    runs = cluster_runs(bars, n_tol, signal_ids)
+    er = sum(r['entry_rows'] for r in runs)
+    ds = sum(r['distinct_signals'] for r in runs)
+    return (1.0 - ds / er) if er else 0.0
+
+
+def depth_yield_direction(entry_bars_d, traded_day_count, S, n_tol, signal_ids_d=None):
     if traded_day_count <= 0:
         return 0.0, 0
-    sizes = clusters_from_entries(entry_bars_d, n_tol)
+    sizes = clusters_from_entries(entry_bars_d, n_tol, signal_ids_d)
     ge = int(sum(1 for s in sizes if s >= S))
     return float(ge) / float(traded_day_count), ge
 
@@ -308,20 +356,26 @@ def entry_basis_traded_days(trades, entry_bar_to_day):
     return int(pd.unique(np.asarray(entry_bar_to_day)[bars]).shape[0])
 
 
-def depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S=S_DEFAULT, n_tol=N_TOLERANCE):
-    dl, gl = depth_yield_direction(entries_by_dir.get(1, []), signals_by_dir.get(1, 0), traded_day_count, S, n_tol)
-    ds, gs = depth_yield_direction(entries_by_dir.get(-1, []), signals_by_dir.get(-1, 0), traded_day_count, S, n_tol)
+def depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S=S_DEFAULT, n_tol=N_TOLERANCE,
+                     ids_by_dir=None):
+    ids_by_dir = ids_by_dir or {}
+    dl, gl = depth_yield_direction(entries_by_dir.get(1, []), traded_day_count, S, n_tol,
+                                   ids_by_dir.get(1))
+    ds, gs = depth_yield_direction(entries_by_dir.get(-1, []), traded_day_count, S, n_tol,
+                                   ids_by_dir.get(-1))
     return {'DepthYield_LONG': dl, 'DepthYield_SHORT': ds,
             'clusters_ge_S_LONG': gl, 'clusters_ge_S_SHORT': gs,
             'S': S, 'N': n_tol, 'traded_days': traded_day_count,
             'signals_LONG': signals_by_dir.get(1, 0), 'signals_SHORT': signals_by_dir.get(-1, 0)}
 
 
-def depth_yield_grid(entries_by_dir, signals_by_dir, traded_day_count, s_grid=S_GRID, tolerances=(1, 5, 10, 15, 20, 25, 30)):
+def depth_yield_grid(entries_by_dir, signals_by_dir, traded_day_count, s_grid=S_GRID,
+                     tolerances=(1, 5, 10, 15, 20, 25, 30), ids_by_dir=None):
     rows = []
     for n_tol in tolerances:
         for S in s_grid:
-            r = depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S, n_tol)
+            r = depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S, n_tol,
+                                 ids_by_dir=ids_by_dir)
             dl, ds = r['DepthYield_LONG'], r['DepthYield_SHORT']
             gl, gs = r['clusters_ge_S_LONG'], r['clusters_ge_S_SHORT']
             nl, ns = r['signals_LONG'], r['signals_SHORT']

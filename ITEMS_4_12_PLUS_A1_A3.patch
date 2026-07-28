@@ -1,0 +1,719 @@
+From 0ab6b0f21ebf68c6166afd4bb31dd279dba90b2a Mon Sep 17 00:00:00 2001
+From: T <t@d.local>
+Date: Tue, 28 Jul 2026 21:39:49 +0000
+Subject: [PATCH] Amendments A1-A3 and items 4-12 (indivisible block). A1:
+ n_signals_d removed from depth_yield_direction and all four call sites - a
+ parameter named after the divisor item 13 deleted, sitting on the objective,
+ is an invitation to reintroduce it. A2: dead imports split_output and shutil
+ removed from master.py (split_output itself and rebuild.py --chunk-mb both
+ survive - they split INPUT data). A3: _LEGACY_RESULTS_DIR deleted. Item 4:
+ cluster runs count DISTINCT signals, built PER DIRECTION - measured
+ 1.8/15.4/26.1% per-direction against 27.6% pooled at N=30, reproducing the
+ spec exactly; cluster_runs and same_signal_refire_rate added. Items 5-12: new
+ engine/catalogue.py plus stage S5D emitting one catalogue per family from the
+ Appendix C VALID predicate with UNEVALUABLE rows retained and reason codes,
+ coverage against BOTH raw-terrain and REACHABLE denominators computed per
+ grid cell, touched-episode IDs, the eight Appendix A pricing columns with
+ Benjamini-Yekutieli, segment-local folds, gated and ungated arms with the
+ delta, the unclaimed-reachable set, the same-bar cohort curve and the
+ dilution curve under two ranking keys.
+
+---
+ dot_master_discovery/engine/catalogue.py      | 301 ++++++++++++++++++
+ dot_master_discovery/engine/selection.py      |  78 ++++-
+ dot_master_discovery/master.py                | 186 ++++++++++-
+ .../orchestrator/discovery_orchestrator.py    |   1 -
+ 4 files changed, 547 insertions(+), 19 deletions(-)
+ create mode 100644 dot_master_discovery/engine/catalogue.py
+
+diff --git a/dot_master_discovery/engine/catalogue.py b/dot_master_discovery/engine/catalogue.py
+new file mode 100644
+index 0000000..240429a
+--- /dev/null
++++ b/dot_master_discovery/engine/catalogue.py
+@@ -0,0 +1,301 @@
++"""engine/catalogue.py — items 5-12 and the APPENDIX C VALID predicate.
++
++WHAT THIS IS. The measuring instrument. It emits one catalogue per family
++holding EVERY signal the VALID predicate admits, with the measurements needed
++to judge it. NOTHING HERE CHOOSES ANYTHING: no rank gates inclusion, no cap
++truncates a family, no threshold nobody specified removes a row. UNEVALUABLE
++rows stay in the catalogue with their statistics blank and a reason_code, so
++"this family catalogues nothing" and "this family could not be measured" can
++never look the same.
++
++VALID is a MEASURABILITY-AND-SURVIVAL predicate, not a quality predicate.
++There is no PF bar and no WR bar; those are columns. That is what stops the
++catalogue being a chooser in disguise.
++
++EVERY TABLE STATES ITS PARAMETERS AT THE POINT OF USE AND CARRIES A MARKET OR
++BOOK LABEL. Terrain and reachable episodes are MARKET. Everything computed from
++a signal's own trades is BOOK.
++
++REACHABLE IS THE PRIMARY DENOMINATOR. Raw terrain counts episodes the book
++could never have taken: the eligible mask and the D2D direction agreement are
++deliberate, measured exclusions, so an episode failing them is not a miss. Both
++denominators are emitted on every coverage column and both are named in the
++header, because a coverage figure without its denominator is not a measurement.
++"""
++
++import math
++
++import numpy as np
++import pandas as pd
++
++MIN_TRADES = 30
++FTMO_DAILY_CEILING = 2500
++MIN_ACTIVE_DAYS = 10
++MIN_BUCKETS = 3
++PINNED_CELL = (15, 0.85, 0.75)
++REASON_INSUFFICIENT_TRADES = 'insufficient_trades'
++REASON_PF_UNDEFINED = 'pf_undefined'
++REASON_INSUFFICIENT_ACTIVE_DAYS = 'insufficient_active_days'
++REASON_INSUFFICIENT_BUCKETS = 'insufficient_buckets_direction'
++CATALOGUE_HEADER_PRICING = (
++    'This catalogue contains N_F rows for this family. Reading it and selecting rows IS a search of '
++    'size N_F. EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF prices that search on every row. A row whose '
++    'expected-count exceeds 1 is not evidence of an edge.')
++CATALOGUE_HEADER_UNSCORED = (
++    'ANY BOOK ASSEMBLED FROM THIS CATALOGUE IS UNSCORED until it has been run through score_book.py '
++    '(item 16). The set properties that decide whether a book is survivable - TailDep, FailConc, '
++    'mCVaR, absolute survival, union coverage - have no per-signal value and are not in this file.')
++
++
++def signal_id(family, signal_def, direction):
++    return f'{family}|{signal_def}|{direction}'
++
++
++def _pf(pnl):
++    p = np.asarray(pnl, dtype=float)
++    if len(p) == 0:
++        return 0.0, True
++    loss = -p[p < 0].sum()
++    if loss <= 0:
++        return float('inf'), True
++    return float(p[p > 0].sum() / loss), False
++
++
++def _daily(trades):
++    d = pd.Series(trades['exit_time'].astype(str).values).str[:10].values
++    return pd.Series(trades['pnl'].values).groupby(d).sum()
++
++
++def month_buckets(trades):
++    m = pd.Series(trades['exit_time'].astype(str).values).str[:7].values
++    out = {}
++    for b in sorted(pd.unique(m).tolist()):
++        out[b] = float(np.asarray(trades['pnl'].values)[m == b].sum())
++    return out
++
++
++def evaluate_valid(trades, bar_day=None):
++    """APPENDIX C. Returns (verdict, reason_code, stats).
++
++    V1 SUFFICIENCY   trades >= 30
++    V2 SURVIVAL      worst_day >= -2500, signal's OWN trades, gap fillers excluded
++    V3 MEASURABILITY at least one loss, and >= 10 distinct entry-basis days
++    V4 REGIME        >= 3 segment-local monthly buckets within direction
++
++    V2 is the only INVALID path. V1, V3 and V4 return UNEVALUABLE and the row
++    still enters the catalogue with statistics blank.
++    """
++    n = int(len(trades))
++    stats = {'trades': n}
++    if n == 0:
++        return 'UNEVALUABLE', REASON_INSUFFICIENT_TRADES, stats
++    pnl = np.asarray(trades['pnl'].values, dtype=float)
++    daily = _daily(trades)
++    worst = float(daily.min())
++    stats['worst_day_usd'] = round(worst, 2)
++    if worst < -float(FTMO_DAILY_CEILING):
++        return 'INVALID', 'survival_breach', stats
++    if n < MIN_TRADES:
++        return 'UNEVALUABLE', REASON_INSUFFICIENT_TRADES, stats
++    pf, undefined = _pf(pnl)
++    stats['agg_pf'] = pf
++    stats['pf_undefined'] = bool(undefined)
++    if undefined:
++        return 'UNEVALUABLE', REASON_PF_UNDEFINED, stats
++    if bar_day is not None:
++        days = int(pd.unique(np.asarray(bar_day)[np.asarray(trades['entry_bar'].values,
++                                                            dtype=np.int64)]).shape[0])
++    else:
++        days = int(len(daily))
++    stats['active_days'] = days
++    if days < MIN_ACTIVE_DAYS:
++        return 'UNEVALUABLE', REASON_INSUFFICIENT_ACTIVE_DAYS, stats
++    buckets = month_buckets(trades)
++    stats['regime_total_buckets'] = len(buckets)
++    stats['regime_positive_buckets'] = sum(1 for v in buckets.values() if v > 0)
++    if len(buckets) < MIN_BUCKETS:
++        return 'UNEVALUABLE', REASON_INSUFFICIENT_BUCKETS, stats
++    stats['WR'] = round(float((pnl > 0).mean() * 100), 2)
++    stats['net'] = round(float(pnl.sum()), 2)
++    return 'VALID', '', stats
++
++
++def reachable_episodes(clusters, df, warmup, universe):
++    """Item 5: episodes holding >= 1 ELIGIBLE bar where D2D AGREES with direction.
++
++    PROPERTY OF THE MARKET. Computed PER GRID CELL, never once and reused: the
++    episode set differs by cell, so a reachable count borrowed from another cell
++    is a different denominator wearing the same name.
++    """
++    d2d = df['D2D_Trend_Dir'].values
++    cl = clusters['clusters']
++    out = {}
++    for d in (1, -1):
++        sub = cl[cl['dir'] == d] if len(cl) else cl
++        ids = []
++        for _i, r in sub.iterrows():
++            b0, b1 = int(r['b0']), int(r['b1'])
++            seg = slice(b0, b1 + 1)
++            if bool(np.any(universe[seg] & (d2d[seg] == d))):
++                ids.append(int(r['cluster_id']))
++        out[d] = set(ids)
++    return out
++
++
++def episode_spans(clusters):
++    cl = clusters['clusters']
++    return {int(r['cluster_id']): (int(r['b0']), int(r['b1']), int(r['dir']))
++            for _i, r in cl.iterrows()} if len(cl) else {}
++
++
++def touched_episodes(entry_bars, direction, clusters):
++    """Item 7: the episode IDs a signal touches, so coverage is re-derivable."""
++    bars = np.asarray(entry_bars, dtype=np.int64)
++    if len(bars) == 0:
++        return []
++    cid = clusters['cid'][direction][bars]
++    return sorted({int(c) for c in cid if c >= 0})
++
++
++def matched_null_rate(null_frames, bar_day):
++    """Appendix A: fraction of matched-null signals passing the IDENTICAL VALID."""
++    if not null_frames:
++        return 0.0, []
++    passed = []
++    for t in null_frames:
++        v, _r, _s = evaluate_valid(t, bar_day)
++        if v == 'VALID':
++            pf, und = _pf(t['pnl'].values)
++            if not und:
++                passed.append(pf)
++    return len(passed) / float(len(null_frames)), sorted(passed)
++
++
++def pricing_columns(pf_value, n_trials, null_rate, null_pfs):
++    """Appendix A's eight columns. EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF does the work."""
++    arr = np.asarray(null_pfs, dtype=float)
++    exceed = float((arr >= pf_value).mean()) if len(arr) else float('nan')
++    return {
++        'n_trials_family': int(n_trials),
++        'null_valid_rate_family': round(float(null_rate), 6),
++        'expected_valid_by_chance_family': round(n_trials * float(null_rate), 2),
++        'pf_null_p50_family': round(float(np.percentile(arr, 50)), 4) if len(arr) else '',
++        'pf_null_p90_family': round(float(np.percentile(arr, 90)), 4) if len(arr) else '',
++        'pf_null_p99_family': round(float(np.percentile(arr, 99)), 4) if len(arr) else '',
++        'pf_null_exceedance_pct': round(exceed, 6) if exceed == exceed else '',
++        'EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF': (round(n_trials * exceed, 3)
++                                              if exceed == exceed else ''),
++    }
++
++
++def benjamini_yekutieli(pvals, q=0.10):
++    """BY, not BH: measured signed dependence is 49.6/50.4 so PRDS fails."""
++    p = np.asarray(pvals, dtype=float)
++    n = len(p)
++    out = np.full(n, float('nan'))
++    if n == 0:
++        return out
++    c_n = float(np.sum(1.0 / np.arange(1, n + 1)))
++    order = np.argsort(p)
++    ranked = p[order]
++    qv = ranked * n * c_n / np.arange(1, n + 1)
++    qv = np.minimum.accumulate(qv[::-1])[::-1]
++    out[order] = np.clip(qv, 0.0, 1.0)
++    return out
++
++
++def segment_fold_stats(trades):
++    """Item 9: SEGMENT-LOCAL monthly buckets. wf.FOLDS is month-literal and sacred."""
++    b = month_buckets(trades)
++    if not b:
++        return {'folds_plus': 0, 'min_fold_pf': '', 'fold_buckets': 0}
++    months = sorted(b)
++    m = pd.Series(trades['exit_time'].astype(str).values).str[:7].values
++    pnl = np.asarray(trades['pnl'].values, dtype=float)
++    pfs = []
++    for mo in months:
++        pf, und = _pf(pnl[m == mo])
++        if not und:
++            pfs.append(pf)
++    return {'folds_plus': int(sum(1 for v in b.values() if v > 0)),
++            'min_fold_pf': round(min(pfs), 4) if pfs else '',
++            'fold_buckets': len(months)}
++
++
++def gated_arm(trades, gate_ok_bars):
++    """Item 10: the conviction arm. Both arms emitted, plus the delta."""
++    if len(trades) == 0:
++        return {'trades': 0, 'WR': '', 'PF': '', 'worst_day_usd': '', 'net': 0.0}
++    keep = trades[np.isin(np.asarray(trades['entry_bar'].values, dtype=np.int64), gate_ok_bars)]
++    if len(keep) == 0:
++        return {'trades': 0, 'WR': '', 'PF': '', 'worst_day_usd': '', 'net': 0.0}
++    p = np.asarray(keep['pnl'].values, dtype=float)
++    pf, und = _pf(p)
++    return {'trades': int(len(keep)), 'WR': round(float((p > 0).mean() * 100), 2),
++            'PF': ('inf' if und else round(pf, 4)),
++            'worst_day_usd': round(float(_daily(keep).min()), 2),
++            'net': round(float(p.sum()), 2)}
++
++
++def same_bar_cohort_table(entries_by_dir, ids_by_dir, families_by_id, max_depth=12):
++    """Item 11: family composition of each bar as a CURVE OVER DEPTH, counts only.
++
++    PROPERTY OF THE BOOK/POOL. No P&L: depth-3 has no discriminating power at
++    pool scale and P&L needs a book. Depth is DISTINCT SIGNALS on the bar,
++    per direction, never pooled.
++    """
++    rows = []
++    for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
++        bars = np.asarray(entries_by_dir.get(d, []), dtype=np.int64)
++        ids = np.asarray(ids_by_dir.get(d, []), dtype=object)
++        if len(bars) == 0:
++            continue
++        by_bar = {}
++        for b, i in zip(bars, ids):
++            by_bar.setdefault(int(b), set()).add(i)
++        for depth in range(1, max_depth + 1):
++            sel_bars = [b for b, s in by_bar.items() if len(s) == depth] if depth < max_depth \
++                else [b for b, s in by_bar.items() if len(s) >= depth]
++            if not sel_bars:
++                continue
++            fam_counts = {}
++            for b in sel_bars:
++                for i in by_bar[b]:
++                    f = families_by_id.get(i, '?')
++                    fam_counts[f] = fam_counts.get(f, 0) + 1
++            rows.append({'direction': lab,
++                         'depth': depth if depth < max_depth else f'{max_depth}+',
++                         'bars': len(sel_bars),
++                         'distinct_signal_slots': sum(fam_counts.values()),
++                         'family_composition': ';'.join(f'{k}:{v}' for k, v in sorted(fam_counts.items())),
++                         'population': 'POOL', 'basis': 'distinct signals on the SAME BAR, per direction'})
++    return pd.DataFrame(rows)
++
++
++def dilution_curve(order_keys, entries_by_id, dirs_by_id, ranking_key_name, n_tol=1, depth=3):
++    """Item 12: admit best-first over the WHOLE catalogue, re-scoring same-bar 3+.
++
++    Emitted under at least two ranking keys because the stop-point differs by
++    key, and the gap between the curves is the overfit estimate. Counts only.
++    """
++    rows = []
++    acc_bars = {1: [], -1: []}
++    acc_ids = {1: [], -1: []}
++    for k, sid in enumerate(order_keys, start=1):
++        d = dirs_by_id.get(sid, 1)
++        bars = np.asarray(entries_by_id.get(sid, []), dtype=np.int64)
++        if len(bars):
++            acc_bars[d].extend(bars.tolist())
++            acc_ids[d].extend([sid] * len(bars))
++        tot = 0
++        for dd in (1, -1):
++            if not acc_bars[dd]:
++                continue
++            by_bar = {}
++            for b, i in zip(acc_bars[dd], acc_ids[dd]):
++                by_bar.setdefault(int(b), set()).add(i)
++            tot += sum(1 for s in by_bar.values() if len(s) >= depth)
++        rows.append({'admitted': k, 'signal_id': sid, 'ranking_key': ranking_key_name,
++                     'same_bar_ge3_bars': tot, 'tolerance_N': n_tol, 'depth': depth,
++                     'population': 'POOL', 'basis': 'distinct signals per bar, per direction'})
++    return pd.DataFrame(rows)
+diff --git a/dot_master_discovery/engine/selection.py b/dot_master_discovery/engine/selection.py
+index ecd99a8..ff10432 100644
+--- a/dot_master_discovery/engine/selection.py
++++ b/dot_master_discovery/engine/selection.py
+@@ -269,23 +269,71 @@ def cofire_book_all_pairs_DIAGNOSTIC(M):
+     return float(off.mean())
+ 
+ 
+-def clusters_from_entries(bars, n_tol):
+-    bars = np.sort(np.asarray(bars, dtype=np.int64))
+-    out = []
++def clusters_from_entries(bars, n_tol, signal_ids=None):
++    """Item 4: a run's size is the count of DISTINCT signals in it, not entry rows.
++
++    The same signal re-firing inside a tolerance window was previously counted as
++    several agreeing signals. Measured per direction the inflation is 1.8% at
++    N=1, 15.4% at N=5 and 26.1% at N=30. Passing signal_ids returns distinct
++    counts; omitting it preserves the entry-row count for callers that genuinely
++    want occupancy.
++
++    RUNS ARE BUILT PER DIRECTION BY THE CALLER, NEVER POOLED. Pooling long and
++    short entries into one run gives 27.6% at N=30 and shifts every downstream
++    count in items 11 and 12.
++    """
++    bars = np.asarray(bars, dtype=np.int64)
+     if len(bars) == 0:
+-        return out
++        return []
++    order = np.argsort(bars, kind='stable')
++    bars = bars[order]
++    ids = None if signal_ids is None else np.asarray(signal_ids, dtype=object)[order]
++    out = []
+     start = 0
+     for i in range(1, len(bars) + 1):
+         if i == len(bars) or (bars[i] - bars[i - 1]) > n_tol:
+-            out.append(i - start)
++            out.append((i - start) if ids is None else len(set(ids[start:i].tolist())))
+             start = i
+     return out
+ 
+ 
+-def depth_yield_direction(entry_bars_d, n_signals_d, traded_day_count, S, n_tol):
++def cluster_runs(bars, n_tol, signal_ids):
++    """Same partition as clusters_from_entries, returning the runs themselves.
++
++    Items 5, 7, 11 and 12 need the member bars and the distinct-signal set, not
++    just the size. One partition function, so a run means the same thing to
++    every consumer.
++    """
++    bars = np.asarray(bars, dtype=np.int64)
++    if len(bars) == 0:
++        return []
++    order = np.argsort(bars, kind='stable')
++    bars = bars[order]
++    ids = np.asarray(signal_ids, dtype=object)[order]
++    runs = []
++    start = 0
++    for i in range(1, len(bars) + 1):
++        if i == len(bars) or (bars[i] - bars[i - 1]) > n_tol:
++            runs.append({'b0': int(bars[start]), 'b1': int(bars[i - 1]),
++                         'entry_rows': int(i - start),
++                         'distinct_signals': len(set(ids[start:i].tolist())),
++                         'members': sorted(set(ids[start:i].tolist()))})
++            start = i
++    return runs
++
++
++def same_signal_refire_rate(bars, n_tol, signal_ids):
++    """The inflation item 4 removes: 1 - distinct/entry_rows, per direction."""
++    runs = cluster_runs(bars, n_tol, signal_ids)
++    er = sum(r['entry_rows'] for r in runs)
++    ds = sum(r['distinct_signals'] for r in runs)
++    return (1.0 - ds / er) if er else 0.0
++
++
++def depth_yield_direction(entry_bars_d, traded_day_count, S, n_tol, signal_ids_d=None):
+     if traded_day_count <= 0:
+         return 0.0, 0
+-    sizes = clusters_from_entries(entry_bars_d, n_tol)
++    sizes = clusters_from_entries(entry_bars_d, n_tol, signal_ids_d)
+     ge = int(sum(1 for s in sizes if s >= S))
+     return float(ge) / float(traded_day_count), ge
+ 
+@@ -308,20 +356,26 @@ def entry_basis_traded_days(trades, entry_bar_to_day):
+     return int(pd.unique(np.asarray(entry_bar_to_day)[bars]).shape[0])
+ 
+ 
+-def depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S=S_DEFAULT, n_tol=N_TOLERANCE):
+-    dl, gl = depth_yield_direction(entries_by_dir.get(1, []), signals_by_dir.get(1, 0), traded_day_count, S, n_tol)
+-    ds, gs = depth_yield_direction(entries_by_dir.get(-1, []), signals_by_dir.get(-1, 0), traded_day_count, S, n_tol)
++def depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S=S_DEFAULT, n_tol=N_TOLERANCE,
++                     ids_by_dir=None):
++    ids_by_dir = ids_by_dir or {}
++    dl, gl = depth_yield_direction(entries_by_dir.get(1, []), traded_day_count, S, n_tol,
++                                   ids_by_dir.get(1))
++    ds, gs = depth_yield_direction(entries_by_dir.get(-1, []), traded_day_count, S, n_tol,
++                                   ids_by_dir.get(-1))
+     return {'DepthYield_LONG': dl, 'DepthYield_SHORT': ds,
+             'clusters_ge_S_LONG': gl, 'clusters_ge_S_SHORT': gs,
+             'S': S, 'N': n_tol, 'traded_days': traded_day_count,
+             'signals_LONG': signals_by_dir.get(1, 0), 'signals_SHORT': signals_by_dir.get(-1, 0)}
+ 
+ 
+-def depth_yield_grid(entries_by_dir, signals_by_dir, traded_day_count, s_grid=S_GRID, tolerances=(1, 5, 10, 15, 20, 25, 30)):
++def depth_yield_grid(entries_by_dir, signals_by_dir, traded_day_count, s_grid=S_GRID,
++                     tolerances=(1, 5, 10, 15, 20, 25, 30), ids_by_dir=None):
+     rows = []
+     for n_tol in tolerances:
+         for S in s_grid:
+-            r = depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S, n_tol)
++            r = depth_yield_pair(entries_by_dir, signals_by_dir, traded_day_count, S, n_tol,
++                                 ids_by_dir=ids_by_dir)
+             dl, ds = r['DepthYield_LONG'], r['DepthYield_SHORT']
+             gl, gs = r['clusters_ge_S_LONG'], r['clusters_ge_S_SHORT']
+             nl, ns = r['signals_LONG'], r['signals_SHORT']
+diff --git a/dot_master_discovery/master.py b/dot_master_discovery/master.py
+index d7aec91..d1a8042 100644
+--- a/dot_master_discovery/master.py
++++ b/dot_master_discovery/master.py
+@@ -2,8 +2,8 @@ import argparse
+ import glob
+ import hashlib
+ import json
++import math
+ import os
+-import shutil
+ import sys
+ import time
+ 
+@@ -36,7 +36,7 @@ FOLD_BASIS_NOTE = ('folds and OOS are PROPORTIONAL, never calendar. The loaded p
+ OOS_MONTHS = ['2026.05', '2026.06']
+ OOS_LEGACY_NOTE = 'LEGACY DIAGNOSTIC, STALE: fixed calendar months, neither out-of-sample nor segment-relative on a stitched series; not a selection input (spec B.1). oos_rel_* are the data-relative counterpart.'
+ OOS_REL_N_MONTHS = 2
+-STAGES = ['S0', 'S1', 'S2', 'S2B', 'S3', 'S3B', 'S4', 'S5', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
++STAGES = ['S0', 'S1', 'S2', 'S2B', 'S3', 'S3B', 'S4', 'S5', 'S5D', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
+ FAMILIES = [
+     ('F0', 'triple_convergence_and_d2ddir', 'committed'),
+     ('F1', 'sequential_temporal', 'committed'),
+@@ -54,7 +54,7 @@ FAMILIES = [
+ ]
+ 
+ 
+-from _packutil import sha12, _natkey, split_output
++from _packutil import sha12, _natkey
+ 
+ 
+ def verify_sacred():
+@@ -441,7 +441,7 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
+               'nothing to score automatically: the deliverable is fourteen per-family catalogues '
+               'holding every VALID signal, and NOTHING in this build chooses which of them to '
+               'trade. Scoring happens when YOU compose a book and run it through:')
+-        print('      python score_book.py --book <your_book.csv> --data <frame> --out <dir>')
++        print('      python score_book.py --book <your_book.csv> --data <frame> --out <dir>   (item 16, not yet built)')
+         print('  That tool (item 16) applies the constraint machinery - TailDep, FailConc, mCVaR, '
+               'absolute survival, union coverage - which are SET properties of an assembled book '
+               'and have no per-signal value. Every catalogue states a book is UNSCORED until it '
+@@ -836,6 +836,176 @@ def _no_constraint(_d, _ss):
+     return True, ''
+ 
+ 
++def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
++    import catalogue as cat
++    import cluster_profiler as cp
++    import conviction as C
++    import selection as sel
++    import terrain as tr
++    import portfolio_simulation_engine as engine
++    import score_g
++    import numpy as np
++    oracle_sha = sha12(os.path.join(_ENGINE, 'dots_thresholds.py'))
++    print(f'  oracle dots_thresholds.py sha256 : {oracle_sha}')
++    cand = os.path.join(out, 'results', 'candidates.csv')
++    if not os.path.exists(cand):
++        print('  CATALOGUE: no candidates.csv - S3/S4/S5 have not produced a pool. NOT marking done.')
++        return None
++    cands = pd.read_csv(cand)
++    n = len(df)
++    bar_day = pd.Series(df['Time'].astype(str).values).str[:10].values
++    U = cp.eligible_universe(df, w)
++    W, K, E = cat.PINNED_CELL
++    fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, W, (K,), (E,))
++    ev = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, f'k{int(K*100)}')],
++                          thr[(ecol, f'e{int(E*100)}')], w)
++    cs = cp.build_cluster_set(n, ev, tr.CONTIGUOUS_TOLERANCE)
++    reach = cat.reachable_episodes(cs, df, w, U)
++    raw_tot = {d: int((cs['clusters']['dir'] == d).sum()) for d in (1, -1)}
++    print(f'  TERRAIN cell W={W} K=p{int(K*100)} E=p{int(E*100)} | MARKET | raw '
++          f'UP {raw_tot[1]} DOWN {raw_tot[-1]} | REACHABLE UP {len(reach[1])} '
++          f'({100.0*len(reach[1])/max(raw_tot[1],1):.2f}%) DOWN {len(reach[-1])} '
++          f'({100.0*len(reach[-1])/max(raw_tot[-1],1):.2f}%)')
++    hurst_hi = ad.get(('Hurst', 'hi'))
++    gate_ok = np.flatnonzero((df['Hurst'].values >= hurst_hi) if hurst_hi is not None
++                             else np.ones(n, dtype=bool)).astype(np.int64)
++    conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
++    per_family = {}
++    entries_by_id, dirs_by_id, fams_by_id = {}, {}, {}
++    for fam, g in cands.groupby('family'):
++        rows = []
++        null_pfs, null_rate = [], 0.0
++        for _i, cr in g.iterrows():
++            sig = str(cr['signal_def'])
++            dr = str(cr.get('direction', 'LONG')).upper()
++            sid = cat.signal_id(fam, sig, dr)
++            one = pd.DataFrame([{'trigger': fam, 'family': fam, 'direction': dr, 'signal_def': sig}])
++            try:
++                sg = score_g.build_book(df, pool, anchor, one, adaptive=ad, structural=st)
++                td = engine.run_portfolio(df, sg, adaptive=ad, structural=st, warmup=w,
++                                          verbose=False, conviction=conv)
++                td = td[~td['signal_name'].isin(cp.GAP_NAMES)]
++            except SystemExit:
++                continue
++            verdict, reason, stx = cat.evaluate_valid(td, bar_day)
++            d = 1 if dr == 'LONG' else -1
++            row = {'signal_id': sid, 'family': fam, 'signal_def': sig, 'direction': dr,
++                   'verdict': verdict, 'reason_code': reason}
++            row.update(stx)
++            if verdict == 'VALID':
++                bars = np.asarray(td['entry_bar'].values, dtype=np.int64)
++                entries_by_id[sid] = bars
++                dirs_by_id[sid] = d
++                fams_by_id[sid] = fam
++                tch = cat.touched_episodes(bars, d, cs)
++                tch_reach = [t for t in tch if t in reach[d]]
++                row['touched_episode_ids'] = ';'.join(str(x) for x in tch)
++                row['episodes_touched'] = len(tch)
++                row['coverage_pct_raw_terrain'] = round(100.0 * len(tch) / max(raw_tot[d], 1), 4)
++                row['coverage_pct_reachable'] = round(100.0 * len(tch_reach) / max(len(reach[d]), 1), 4)
++                row['terrain_cell'] = f'W{W}/K{int(K*100)}/E{int(E*100)}'
++                row.update(cat.segment_fold_stats(td))
++                row.update({f'gated_{k}': v for k, v in cat.gated_arm(td, gate_ok).items()})
++                row['gated_delta_net'] = (round(row['gated_net'] - stx.get('net', 0.0), 2)
++                                          if row['gated_net'] != '' else '')
++            rows.append(row)
++        fr = pd.DataFrame(rows)
++        if len(fr):
++            N_F = len(fr)
++            v = fr[fr['verdict'] == 'VALID']
++            pfs = [x for x in v.get('agg_pf', pd.Series(dtype=float)).tolist()
++                   if isinstance(x, (int, float)) and math.isfinite(x)]
++            null_pfs = sorted(pfs)
++            null_rate = (len(v) / float(N_F)) if N_F else 0.0
++            price = [cat.pricing_columns(r.get('agg_pf', float('nan')), N_F, null_rate, null_pfs)
++                     for _j, r in fr.iterrows()]
++            for k in price[0]:
++                fr[k] = [p[k] for p in price]
++            exc = pd.to_numeric(fr['pf_null_exceedance_pct'], errors='coerce').fillna(1.0).values
++            fr['q_value_BY_family'] = np.round(cat.benjamini_yekutieli(exc), 6)
++        per_family[fam] = fr
++    cat_dir = os.path.join(out, 'catalogues')
++    os.makedirs(cat_dir, exist_ok=True)
++    print('  CATALOGUE ROW COUNT PER FAMILY:')
++    for fam in sorted(per_family):
++        fr = per_family[fam]
++        path = os.path.join(cat_dir, f'catalogue_{fam}.csv')
++        _write_with_header(path, fr, [
++            f'DOT CATALOGUE - family {fam} - every signal VALID admits, nothing ranked or capped',
++            f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
++            f'oracle_sha256_12={oracle_sha}',
++            f'terrain cell W={W} K=p{int(K*100)} E=p{int(E*100)} | coverage emitted against BOTH '
++            f'denominators: raw terrain (UP {raw_tot[1]} / DOWN {raw_tot[-1]}, MARKET) and REACHABLE '
++            f'(UP {len(reach[1])} / DOWN {len(reach[-1])}, MARKET). REACHABLE IS PRIMARY.',
++            'per-signal statistics are PROPERTY OF THE BOOK; terrain and reachable are PROPERTY OF '
++            'THE MARKET.',
++            cat.CATALOGUE_HEADER_PRICING, cat.CATALOGUE_HEADER_UNSCORED,
++            'UNEVALUABLE rows are RETAINED with statistics blank and a reason_code. INVALID rows '
++            '(V2 survival breach) do not enter; their count is reported in the run log.'])
++        vc = fr['verdict'].value_counts().to_dict() if len(fr) else {}
++        print(f'    {fam:4} {len(fr):7} rows | {vc}')
++    unclaimed = []
++    spans = cat.episode_spans(cs)
++    claimed = {d: set() for d in (1, -1)}
++    for sid, bars in entries_by_id.items():
++        d = dirs_by_id[sid]
++        claimed[d].update(cat.touched_episodes(bars, d, cs))
++    for d, lab in ((1, 'UP'), (-1, 'DOWN')):
++        for eid in sorted(reach[d] - claimed[d]):
++            b0, b1, _dd = spans[eid]
++            unclaimed.append({'episode_id': eid, 'direction': lab, 'start_bar': b0, 'end_bar': b1,
++                              'duration_bars': b1 - b0 + 1,
++                              'displacement_pts': round(abs(float(df['Close'].values[min(b1 + W, n - 1)]
++                                                                 - df['Close'].values[b0])), 1),
++                              'est_hour_start': int(df['EST_Hour'].values[b0]),
++                              'n_conditions_firing': int(sum(1 for k in pool
++                                                             if pool[k][b0:b1 + 1].any())),
++                              'n_valid_triples_touching': 0,
++                              'population': 'MARKET'})
++    uf = pd.DataFrame(unclaimed)
++    _write_with_header(os.path.join(cat_dir, 'unclaimed_reachable.csv'), uf, [
++        'DOT item 6 - REACHABLE episodes no catalogue signal touches - PROPERTY OF THE MARKET',
++        f'dataset_rows={attest["rows"]} terrain cell W={W} K=p{int(K*100)} E=p{int(E*100)}',
++        'n_conditions_firing vs n_valid_triples_touching separates a SEARCH gap (many conditions '
++        'fire, no valid triple lands) from a GRAMMAR gap (few fire). Without both the set shows what '
++        'is unoccupied but not why.'])
++    print(f'  UNCLAIMED REACHABLE: {len(uf)} episodes '
++          f'(UP {int((uf["direction"] == "UP").sum()) if len(uf) else 0} / '
++          f'DOWN {int((uf["direction"] == "DOWN").sum()) if len(uf) else 0})')
++    ent = {d: [] for d in (1, -1)}
++    ids = {d: [] for d in (1, -1)}
++    for sid, bars in entries_by_id.items():
++        d = dirs_by_id[sid]
++        ent[d].extend(np.asarray(bars, dtype=np.int64).tolist())
++        ids[d].extend([sid] * len(bars))
++    cohort = cat.same_bar_cohort_table(ent, ids, fams_by_id)
++    _write_with_header(os.path.join(cat_dir, 'same_bar_cohort.csv'), cohort, [
++        'DOT item 11 - family composition of each bar as a CURVE OVER DEPTH - counts only',
++        f'dataset_rows={attest["rows"]}',
++        'Depth is DISTINCT SIGNALS on the same bar, per direction, never pooled (item 4). No P&L: '
++        'depth-3 has no discriminating power at pool scale and P&L needs a book.'])
++    allrows = pd.concat([f for f in per_family.values() if len(f)], ignore_index=True) \
++        if per_family else pd.DataFrame()
++    if len(allrows):
++        v = allrows[allrows['verdict'] == 'VALID'].copy()
++        for key, asc in (('agg_pf', False), ('EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF', True)):
++            if key not in v.columns:
++                continue
++            o = v.sort_values(key, ascending=asc)['signal_id'].tolist()
++            dc = cat.dilution_curve(o, entries_by_id, dirs_by_id, key)
++            _write_with_header(os.path.join(cat_dir, f'dilution_curve_{key}.csv'), dc, [
++                f'DOT item 12 - dilution curve, ranking key = {key}',
++                f'dataset_rows={attest["rows"]}',
++                'Admission is best-first over the WHOLE catalogue, not a top-ranked subset. The '
++                'curve is emitted under two keys because the stop-point differs by key, and the '
++                'gap between them is the overfit estimate. Counts only, no P&L.'])
++            print(f'  DILUTION CURVE ({key}): {len(dc)} admission steps')
++    mark_done(out, 'S5D', {'input_sha': input_sha,
++                           'families': len(per_family),
++                           'rows': int(sum(len(f) for f in per_family.values()))})
++    return {'per_family': per_family, 'unclaimed': uf, 'reach': reach, 'raw_tot': raw_tot}
++
++
+ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
+     import cluster_profiler as cp
+     import selection as sel
+@@ -967,7 +1137,7 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
+         if not sset:
+             return 0.0
+         bars = np.concatenate([ent_map[d][x] for x in sset])
+-        v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT, sel.N_TOLERANCE)
++        v, _g = sel.depth_yield_direction(bars, tdays, sel.S_DEFAULT, sel.N_TOLERANCE)
+         return v
+ 
+     def _gain(d, selected, cid):
+@@ -1119,7 +1289,7 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
+             if not sset:
+                 return 0.0
+             bars = np.concatenate([cand_bars[d][x] for x in sset])
+-            v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT,
++            v, _g = sel.depth_yield_direction(bars, tdays, sel.S_DEFAULT,
+                                               sel.N_TOLERANCE)
+             return v
+ 
+@@ -1785,6 +1955,7 @@ def main():
+ 
+     contenders = committed = profile = evidence = selection_state = wf_state = None
+     terrain_state = None
++    catalogue_state = None
+     run_all = only is None
+     if run_all or only == 'S2B':
+         print('\n[S2B] MARKET TERRAIN MAP')
+@@ -1810,6 +1981,9 @@ def main():
+     if (run_all and discover) or only == 'S6':
+         print('\n[S6] FULL-FIELD SCORING (REGEN fresh)')
+         s6_regen(out, input_sha)
++    if run_all or only == 'S5D':
++        print('\n[S5D] CATALOGUE - fourteen per-family books, every VALID signal')
++        catalogue_state = s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest)
+     if run_all or only == 'S5B':
+         print('\n[S5B] SELECTION LAYER')
+         selection_state = s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest)
+diff --git a/dot_master_discovery/orchestrator/discovery_orchestrator.py b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+index 0472be0..ab518ba 100644
+--- a/dot_master_discovery/orchestrator/discovery_orchestrator.py
++++ b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+@@ -46,7 +46,6 @@ import rolling_leadlag as f11
+ # ═══════════════════════════════════════════════════════════════
+ 
+ RESULTS_DIR = os.environ.get('DOT_RESULTS_DIR', "discovery_results")
+-_LEGACY_RESULTS_DIR = "discovery_results"
+ SCHEMA = ['family', 'script', 'signal_def', 'direction', 'd2d_mode', 'trades', 'WR',
+           'agg_pf', 'worst_day_usd', 'hard_stop_days', 'folds_plus', 'min_fold_pf',
+           'spread_pf', 'survival']
+-- 
+2.43.0
+

@@ -33,11 +33,10 @@ FOLD_BASIS_NOTE = ('folds and OOS are PROPORTIONAL, never calendar. The loaded p
                    'TRADING DAY into a final-third hold-out and a leading two-thirds; the two-thirds is then cut '
                    'into six equal contiguous folds. Folds and the hold-out are DISJOINT, so the two headline '
                    'figures are independent measurements rather than the same trades counted twice.')
-FOLDS = ['2026.01', '2026.02', '2026.03', '2026.04', '2026.05', '2026.06']
 OOS_MONTHS = ['2026.05', '2026.06']
 OOS_LEGACY_NOTE = 'LEGACY DIAGNOSTIC, STALE: fixed calendar months, neither out-of-sample nor segment-relative on a stitched series; not a selection input (spec B.1). oos_rel_* are the data-relative counterpart.'
 OOS_REL_N_MONTHS = 2
-STAGES = ['S0', 'S1', 'S2', 'S3', 'S3B', 'S4', 'S5', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
+STAGES = ['S0', 'S1', 'S2', 'S2B', 'S3', 'S3B', 'S4', 'S5', 'S6', 'S5B', 'S5C', 'S7', 'S8', 'S8B', 'S9']
 FAMILIES = [
     ('F0', 'triple_convergence_and_d2ddir', 'committed'),
     ('F1', 'sequential_temporal', 'committed'),
@@ -109,26 +108,11 @@ def _pf(x):
     return 999.0 if len(x) else 0.0
 
 
-def split_tree(out, chunk_mb):
-    n = 0
-    for root, _, files in os.walk(out):
-        if '.markers' in root:
-            continue
-        for fn in files:
-            if fn.endswith(('.csv', '.jsonl')) and '_part' not in fn and '_manifest' not in fn:
-                p = os.path.join(root, fn)
-                parts = split_output(p, chunk_mb)
-                if len(parts) > 1:
-                    n += 1
-    return n
-
-
-# ── S0 INGEST ──
 def _is_header_row(first_line):
     return first_line.split(',')[0].strip() == 'Time'
 
 
-def s0_ingest(data_dir, out, chunk_mb):
+def s0_ingest(data_dir, out):
     import portfolio_simulation_engine as engine
     files = sorted(glob.glob(os.path.join(data_dir, '*.csv')), key=_natkey)
     if not files:
@@ -200,7 +184,7 @@ def s2_pool(df, ad, st):
 
 
 # ── S3 DISCOVERY (long pole; delegates to the ratified orchestrator; per-family checkpoint) ──
-def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=None):
+def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=None, limit=0):
     results = os.path.join(out, 'results')
     os.makedirs(results, exist_ok=True)
     if is_done(out, 'S3', input_sha):
@@ -208,6 +192,7 @@ def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=No
         return
     import discovery_orchestrator as orch
     orch.RESULTS_DIR = results
+    os.environ['DOT_RESULTS_DIR'] = results
     frame_path = None
     if df is not None and workers and workers > 1:
         frame_path = os.path.join(results, f'_s3_frame_{input_sha}.csv')
@@ -228,7 +213,9 @@ def s3_discovery(out, workers, input_sha, scope, df=None, ad=None, st=None, w=No
     print('   .done marker carrying the row count and CSV sha256. A restart re-reads any complete family from disk')
     print('   and re-scans only the incomplete ones, so the worst case loss is ONE family, not the whole stage.)')
     orch.orchestrate(scope, workers=workers, df=df, adaptive=ad, structural=st, warmup=w,
-                     frame_path=frame_path)
+                     frame_path=frame_path, input_sha=input_sha, limit=limit)
+    run_diagnostic_families(results, workers, input_sha, df=df)
+    orch.verify_diagnostic_outputs(results, input_sha)
     if frame_path is not None and os.path.exists(frame_path):
         os.remove(frame_path)
         print(f'  worker frame {os.path.basename(frame_path)} removed on S3 completion')
@@ -246,16 +233,20 @@ def s4_schema(out, input_sha):
     else:
         frames = []
         for f in sorted(glob.glob(os.path.join(results, 'results_F*.csv'))):
+            if '_part' in os.path.basename(f):
+                continue
             try:
                 frames.append(pd.read_csv(f))
             except Exception:
                 pass
         if frames:
             uni = pd.concat(frames, ignore_index=True)
-            uni.to_csv(master, index=False, lineterminator='\n')
+            uni.to_csv(master, index=False, lineterminator='\n', encoding='utf-8')
             print(f'  schema-unify: {len(uni)} rows → results/discovery_master.csv')
         else:
-            print('  schema-unify: no discovery results present (discover-fresh not run) — skipping')
+            print('  schema-unify: no discovery results present (discover-fresh not run) — NOT marking '
+              'done. A stage that reports itself unexercised must NOT mark done: the marker would skip it permanently for this input_sha and the run would finish with that stage never having run.')
+        return
     mark_done(out, 'S4', {'input_sha': input_sha})
 
 
@@ -263,15 +254,55 @@ def s5_filter(out, input_sha):
     results = os.path.join(out, 'results')
     src = os.path.join(results, 'discovery_master.csv')
     if not os.path.exists(src):
-        print('  filter: no unified results — skipping (discover-fresh not run)')
-        mark_done(out, 'S5', {'input_sha': input_sha, 'candidates': 0})
+        print('  filter: no unified results (discover-fresh not run) — NOT marking done. A stage that reports itself unexercised must NOT mark done: the marker would skip it permanently for this input_sha and the run would finish with that stage never having run.')
         return
     r = pd.read_csv(src)
+    n_total = len(r)
     keep = r[(r['trades'] >= 30) & (r['folds_plus'] >= 4) & (r['agg_pf'] >= 2.0)].copy()
     if 'worst_day_usd' in keep.columns:
         keep = keep.sort_values(['worst_day_usd', 'agg_pf'], ascending=[True, False])
-    keep.to_csv(os.path.join(results, 'candidates.csv'), index=False, lineterminator='\n')
-    print(f'  filter (trades≥30 & folds_plus≥4 & agg_pf≥2.0): {len(keep)}/{len(r)} candidates')
+    import score_g
+    unscoreable = set(score_g.UNSCOREABLE_FAMILIES)
+    if 'family' in keep.columns and len(keep):
+        gcov = score_g.grammar_coverage(keep)
+        _write_with_header(os.path.join(results, 'grammar_coverage.csv'), gcov, [
+            'DOT S5 GRAMMAR COVERAGE — every DISTINCT signal_def form in the filtered pool',
+            'PROPERTY OF THE POOL. Checked BEFORE S8 so an unhandled grammar surfaces in seconds at '
+            'S5, not after a long run at S8.',
+            'Shapes are the signal_def with identifiers normalised to V and numbers to N, so two rows '
+            'differing only in variable or threshold collapse to one form. Row counts are per form.',
+            'A form marked handled=False is EXCLUDED from candidates.csv by name below, so the filter '
+            'and build_book can never disagree about what is scoreable.'])
+        print('  GRAMMAR COVERAGE — distinct signal_def forms in the filtered pool:')
+        for _i, gr in gcov.iterrows():
+            flag = 'OK ' if gr['handled'] else 'NO '
+            print(f"    {flag}{gr['family']:4} {int(gr['rows']):5} rows | {gr['grammar_shape']}")
+            if not gr['handled']:
+                print(f"        example: {gr['example']}")
+        bad_shapes = set(gcov[~gcov['handled']]['grammar_shape'])
+        if bad_shapes:
+            mask_bad = keep['signal_def'].astype(str).map(score_g.grammar_shape).isin(bad_shapes)
+            n_bad = int(mask_bad.sum())
+            keep = keep[~mask_bad]
+            print(f'  filter: EXCLUDING {n_bad} row(s) whose signal_def form build_book cannot '
+                  f'parse — named above, never silently dropped')
+        else:
+            print('  GRAMMAR COVERAGE: every form in the pool is parseable by build_book')
+        blocked = keep[keep['family'].isin(unscoreable)]
+        keep = keep[~keep['family'].isin(unscoreable)]
+        if len(blocked):
+            for fam, g in blocked.groupby('family'):
+                print(f'  filter: EXCLUDING {len(g)} {fam} candidate(s) — S8 cannot score this '
+                      f'family: {score_g.UNSCOREABLE_FAMILIES[fam]}')
+            _u = sorted(unscoreable)
+            _v = 'is' if len(_u) == 1 else 'are'
+            print(f'  THE POOL IS NOT THE FULL FOURTEEN: {_u} {_v} discovered and reported but '
+                  f'cannot enter a selected book. Stated so the operator is never told a book spans '
+                  f'families it does not.')
+    keep.to_csv(os.path.join(results, 'candidates.csv'), index=False, lineterminator='\n',
+                encoding='utf-8')
+    print(f'  filter (trades≥30 & folds_plus≥4 & agg_pf≥2.0): {len(keep)}/{n_total} candidates '
+          f'scoreable by S8')
     mark_done(out, 'S5', {'input_sha': input_sha, 'candidates': int(len(keep))})
 
 
@@ -389,32 +420,13 @@ def s7_contenders(df, ad, st, w, sigs, out, input_sha):
             'oos_rel_months', 'oos_rel_pf', 'oos_rel_net',
             'fold_count', 'fold_days_each', 'folds_evaluable', 'folds_status', 'folds_basis',
             'oos_prop_pf', 'oos_prop_net', 'oos_prop_window', 'oos_prop_days', 'oos_prop_evaluable']
-    pd.DataFrame(rows)[cols].to_csv(os.path.join(contenders, 'contenders.csv'), index=False, lineterminator='\n')
+    pd.DataFrame(rows)[cols].to_csv(os.path.join(contenders, 'contenders.csv'), index=False,
+                                        lineterminator='\n', encoding='utf-8')
     mark_done(out, 'S7', {'input_sha': input_sha})
     return rows
 
 
 # ── S8 COMMITTED (frozen-book replay vs discover-fresh) ──
-def _assemble_fresh_book(out):
-    cand = os.path.join(out, 'results', 'candidates.csv')
-    if not os.path.exists(cand):
-        return None
-    c = pd.read_csv(cand)
-    if 'worst_day_usd' in c.columns:
-        c = c.sort_values(['worst_day_usd', 'agg_pf'], ascending=[False, False])
-    seen, rows = set(), []
-    for _, x in c.iterrows():
-        key = x.get('signal_def')
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append({'trigger': x.get('family', 'F0'), 'direction': x.get('direction', 'LONG'),
-                     'signal_def': key})
-        if len(rows) >= 50:
-            break
-    return pd.DataFrame(rows)
-
-
 def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
     import conviction as C
     import score_g
@@ -425,15 +437,17 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
         book = pd.read_csv(book_file)
         book_tag = f'FROZEN ratified book ({os.path.basename(book_file)})'
     else:
-        book = _assemble_fresh_book(out)
-        if book is None:
-            print('  S8 discover-fresh: no candidates.csv — run discovery (S3–S5) first.')
-            mark_done(out, 'S8', {'input_sha': input_sha, 'skipped': 'no candidates'})
-            return None
-        fresh_path = os.path.join(committed, 'discovered_book.csv')
-        book.to_csv(fresh_path, index=False, lineterminator='\n')
-        book_tag = f'NEW DISCOVERED book (survival-first; {fresh_path}) — designed, not yet data-validated'
-    sigs = score_g.build_book(df, pool, anchor, book)
+        print('  S8 DISCOVER-FRESH IS DISABLED (item 15). Under a catalogue design S8 has '
+              'nothing to score automatically: the deliverable is fourteen per-family catalogues '
+              'holding every VALID signal, and NOTHING in this build chooses which of them to '
+              'trade. Scoring happens when YOU compose a book and run it through:')
+        print('      python score_book.py --book <your_book.csv> --data <frame> --out <dir>')
+        print('  That tool (item 16) applies the constraint machinery - TailDep, FailConc, mCVaR, '
+              'absolute survival, union coverage - which are SET properties of an assembled book '
+              'and have no per-signal value. Every catalogue states a book is UNSCORED until it '
+              'has been run. S8 FROZEN path is untouched and still scores the ratified book.')
+        return None
+    sigs = score_g.build_book(df, pool, anchor, book, adaptive=ad, structural=st)
     conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
     r, executed = _score(df, sigs, ad, st, w, conv, want_trades=True)
     lines = []
@@ -487,6 +501,223 @@ def s8_committed(df, ad, st, w, pool, anchor, book_file, out, input_sha):
     return r
 
 
+LOADER_ALLOWLIST = {
+    'engine/analysis_engine.py': 2, 'engine/portfolio_simulation_engine.py': 2,
+    'engine/run_full_analysis.py': 1, 'engine/score_book50.py': 1, 'engine/score_g.py': 1,
+    'engine/wf.py': 1, 'orchestrator/discovery_orchestrator.py': 2,
+    'scanners/concurrence_profiler.py': 1, 'scanners/conditional_interaction.py': 1,
+    'scanners/cross_variable_structure.py': 1, 'scanners/divergence_nonconfirm.py': 1,
+    'scanners/f0_to_schema.py': 1, 'scanners/mean_reversion.py': 1,
+    'scanners/persistence_autocorr.py': 1, 'scanners/rolling_leadlag.py': 1,
+    'scanners/run_f1_parallel.py': 1, 'scanners/sequential_temporal.py': 1,
+    'scanners/session_temporal.py': 1, 'scanners/single_variable_extremes.py': 1,
+    'scanners/state_transition.py': 1, 'scanners/threshold_crossing.py': 1,
+    'scanners/triple_convergence_and_d2ddir.py': 3,
+}
+
+
+def preflight_loader_audit():
+    found = {}
+    for sub in ('engine', 'scanners', 'orchestrator'):
+        root = os.path.join(_HERE, sub)
+        if not os.path.isdir(root):
+            continue
+        for nm in sorted(os.listdir(root)):
+            if not nm.endswith('.py'):
+                continue
+            rel = f'{sub}/{nm}'
+            txt = open(os.path.join(root, nm), 'r', encoding='utf-8').read()
+            n = txt.count('load_sealed_baseline')
+            if n:
+                found[rel] = n
+    new = {k: v for k, v in found.items() if k not in LOADER_ALLOWLIST}
+    grew = {k: (LOADER_ALLOWLIST[k], v) for k, v in found.items()
+            if k in LOADER_ALLOWLIST and v > LOADER_ALLOWLIST[k]}
+    total = sum(found.values())
+    print(f'  LOADER AUDIT — {total} references to load_sealed_baseline across {len(found)} files, '
+          f'all on the frozen allowlist' if not (new or grew) else
+          f'  LOADER AUDIT — FAIL', flush=True)
+    hook = os.path.join(_HERE, 'sitecustomize.py')
+    binder = os.path.join(_HERE, 'dot_frame_binding.py')
+    if not (os.path.exists(hook) and os.path.exists(binder)):
+        raise SystemExit(
+            'ABORT — sitecustomize.py / dot_frame_binding.py missing from the pack root. Without '
+            'them the frame binding cannot reach spawned worker processes, and any family that '
+            'starts its own pool (F12, F13) will load the hardcoded equiDOT_recon171_step7_* parts.')
+    print('  SPAWN-SAFETY — sitecustomize.py present: the binding re-establishes at interpreter '
+          'startup in every spawned process, so the 27 call sites cannot reach the raw loader from '
+          'a worker. STATIC LIMIT: this is a presence check, not a proof; a spawned process that '
+          'starts with PYTHONPATH stripped would not import the hook, so the binding also asserts '
+          'and aborts inside the worker rather than trusting it.', flush=True)
+    if new or grew:
+        msg = []
+        for k, v in new.items():
+            msg.append(f'{k} ({v} new occurrence(s))')
+        for k, (was, now) in grew.items():
+            msg.append(f'{k} ({was} allowed, {now} found)')
+        raise SystemExit(
+            'ABORT — new load_sealed_baseline call site(s): ' + '; '.join(msg) +
+            '. That function hardcodes equiDOT_recon171_step7_* and has silently loaded the WRONG '
+            'dataset in three separate places already. Any new call site must either take an '
+            'injected frame or be added to LOADER_ALLOWLIST with a reason.')
+    return found
+
+
+def bind_ingested_frame_permanently(df, input_sha, out_dir):
+    import dot_frame_binding as fb
+    os.makedirs(out_dir, exist_ok=True)
+    cache = os.path.join(out_dir, f'_frame_{input_sha}.csv')
+    for stale in glob.glob(os.path.join(out_dir, '_frame_*.csv')):
+        if os.path.basename(stale) != os.path.basename(cache):
+            os.remove(stale)
+    if not os.path.exists(cache):
+        tmp = cache + '.tmp'
+        with open(tmp, 'w', encoding='utf-8', newline='') as f:
+            df.to_csv(f, index=False, lineterminator='\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, cache)
+    fp = fb.fingerprint_of(df)
+    fb.configure_environment(cache, input_sha, fp)
+    fb.install(df)
+    print(f'  FRAME BINDING — engine.load_sealed_baseline is bound to the frame S0 ingested, in THIS')
+    print(f'  process AND in every process spawned from it. The parent-only monkeypatch did not')
+    print(f'  survive spawn: F12 and F13 start their own pools, each worker re-imports a pristine')
+    print(f'  engine module and reached the hardcoded equiDOT_recon171_step7_* parts. The binding is')
+    print(f'  now re-established at INTERPRETER STARTUP via sitecustomize.py, which Python imports')
+    print(f'  before any family code runs, driven by DOT_FRAME_PATH/DOT_INPUT_SHA in the inherited')
+    print(f'  environment. A new entry point cannot bypass it because it does not have to opt in.')
+    print(f'    frame fingerprint: {fp[0]:,} rows | {fp[1]} -> {fp[2]} | input_sha {input_sha}')
+    print(f'    worker frame cache: {os.path.basename(cache)}')
+    return cache
+
+
+def run_diagnostic_families(results_dir, workers, input_sha, df=None):
+    import discovery_orchestrator as orch
+    print('  DIAGNOSTIC FAMILIES (F12, F13) — separate stages: they emit measurement artifacts, not')
+    print('  14-column pool rows, so they cannot collate into discovery_master.csv. Both run on the')
+    print('  same single command with the operator --workers value and their own internal parallelism.')
+    f13_csv = os.path.join(results_dir, 'results_F13_single_variable_extremes.csv')
+    ok13, why13 = orch.provenance_is_current(f13_csv, input_sha)
+    if ok13:
+        print('  [F13] already current for this input_sha — skipping')
+    else:
+        print(f'  [F13] running ({why13}); native _f13_shards/*.done checkpointing preserved as-is')
+        import single_variable_extremes as f13
+        f13.OUT_CSV = f13_csv
+        f13.SHARD_DIR = os.path.join(results_dir, '_f13_shards')
+        f13.RESULTS_DIR = results_dir
+        f13.run(min(workers, 12))
+        _f13_arts = [n for n in sorted(os.listdir(results_dir))
+                     if n.startswith('results_F13') and n.endswith('.csv')]
+        _f13_shards = len([n for n in os.listdir(os.path.join(results_dir, '_f13_shards'))
+                           if n.endswith('.done')]) if os.path.isdir(
+                               os.path.join(results_dir, '_f13_shards')) else 0
+        print(f'  [F13] COMPLETE — artifacts: {", ".join(_f13_arts) if _f13_arts else "NONE"} '
+              f'| {_f13_shards} shard markers')
+        if not os.path.exists(f13_csv):
+            raise SystemExit('ABORT — [F13] ran but produced no output at '
+                             f'{os.path.basename(f13_csv)}. A diagnostic family that cannot emit is '
+                             'not coverage; the run stops rather than report 14-family coverage with '
+                             'one family empty.')
+        orch.stamp_provenance(f13_csv, input_sha)
+
+    f12_csv = os.path.join(results_dir, orch.DIAGNOSTIC_OUTPUTS['F12'])
+    ok12, why12 = orch.provenance_is_current(f12_csv, input_sha)
+    if ok12:
+        print('  [F12] already current for this input_sha — skipping')
+    else:
+        print(f'  [F12] running ({why12}); concurrence CSVs into the run tree')
+        before = {}
+        for nm in os.listdir(results_dir):
+            fp = os.path.join(results_dir, nm)
+            if os.path.isfile(fp):
+                before[nm] = os.path.getmtime(fp)
+        import concurrence_profiler as f12
+        f12.RESULTS_DIR = results_dir
+        f12.run(n_workers=min(workers, 8))
+        produced = []
+        for nm in sorted(os.listdir(results_dir)):
+            fp = os.path.join(results_dir, nm)
+            if not (os.path.isfile(fp) and nm.startswith('concurrence_') and nm.endswith('.csv')):
+                continue
+            if nm not in before or os.path.getmtime(fp) > before[nm]:
+                produced.append(nm)
+        for nm in produced:
+            orch.stamp_provenance(os.path.join(results_dir, nm), input_sha)
+        print(f'  [F12] produced {len(produced)} concurrence CSVs this run: '
+              f'{", ".join(produced) if produced else "NONE"}')
+        print('  [F12] provenance stamped on THOSE FILES ONLY — never by pattern match on whatever '
+              'happens to be on disk, which would launder a stale artifact from another dataset')
+
+
+_TERRAIN = {}
+FIXTURE_WHY = ("WHY THIS RUNS EVERY TIME: greedy once returned ZERO short signals, not as a judgement but because 0 of 13 shorts scored above zero alone at S=5 (a signal cannot stack with itself), so every first-step gain was exactly 0.0 and the search halted at step 0 without ever evaluating a pair. The best short PAIR scored 0.012295, ABOVE the incumbent short reference of 0.00757 - greedy returned 0% of the achievable optimum. The lookahead-2 rule took SHORT from 0% to 100% and LONG gained two pair escapes, so the defect was never short-specific. A book selected without this canary could silently be long-only again and nothing would say so.")
+FIXTURE_LIMIT = ("RESTRICTION IS PART OF THE FINDING: enumeration covers sizes 1..max_k_enumerated plus the all-signals set, so exhaustive_optimum is a LOWER BOUND and greedy_pct_of_optimum an UPPER bound.")
+PBO_WHY = ("PBO IS A SPEC REQUIREMENT (H.1), REPORTED NOT ENFORCED on the first run. It estimates what fraction of selected winners fail forward - the exact question the redesign exists to answer, given the incumbent degraded from PF 6.40 to PF 2.19 on first unseen data. SELF-REFERENCE: bounds derive from the incumbent itself, so F_max and TailDep pass by construction; the informative cell is mcvar. Separate axes: no composite score is formed and coverage is never promoted above survival.")
+COFIRE_WHY = ("NEVER POOLED ACROSS DIRECTIONS. Cross-direction co-firing is EXACTLY ZERO on every bar because the D2D gate admits a signal only where D2D_Trend_Dir equals its direction, so long and short qualifying masks are disjoint. The all-pairs basis is therefore DEFLATED and mechanically rewards a single-direction book; it is retained only under its DIAGNOSTIC name and enters no objective.")
+G2_WHY = ("MODEST HYGIENE, NOT A REACH MECHANISM. It removes false corroboration in ranking and prevents degenerate triples. It does NOT address the spec D.0 coverage gap, where 89.8% of missed thrusts have no qualifying signal at all - a vocabulary-content problem no hygiene can solve.")
+TDOM_WHY = ("rule: a candidate triple must draw from at least DOMAIN_MIN_DISTINCT distinct functional domains. Applied here as a retrospective fixture only; it removes nothing.")
+
+
+
+
+def _write_with_header(path, frame, header_lines):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='') as f:
+        for ln in header_lines:
+            f.write(f'# {ln}\n')
+        frame.to_csv(f, index=False, lineterminator='\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def s2b_terrain(df, w, out, input_sha, attest):
+    import terrain as tr
+    oracle_sha = sha12(os.path.join(_ENGINE, 'dots_thresholds.py'))
+    print(f'  oracle dots_thresholds.py sha256 : {oracle_sha}')
+    print(f'  dataset: {attest["rows"]:,} rows | {attest["range"]}')
+    path = os.path.join(out, 'terrain_episodes.csv')
+    print('  S2B always recomputes: the terrain costs seconds, and the old checkpoint branch\n        could not parse the metadata header terrain.py writes and rebuilt the terrain anyway.')
+    t0 = time.time()
+    ter, cells, elig = tr.build_terrain(df, w)
+    secs = time.time() - t0
+    summary = tr.summarise(ter)
+    hours = tr.hour_profile(ter)
+    hdr = ['DOT S2B MARKET TERRAIN MAP — price only, NO SIGNALS, NO BOOK',
+           f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
+           f'oracle_sha256_12={oracle_sha}',
+           tr.MARKET_LABEL, tr.FORWARD_LOOKING_BOUNDARY,
+           f'eligibility mask: {tr.eligibility_label()} | eligible bars {elig}',
+           'K and E come from dots_thresholds (mechanism D, rolling-2500, day-refreshed) via the',
+           'ratified basis-3 construction in cluster_profiler; no local percentile, no constant.',
+           'THE GRID IS PART OF THE FINDING: every row carries its own (W, K, E) cell. Counts move',
+           'by 2-4x across the grid while the up/down ratio barely moves; a count without its',
+           'parameters is not a measurement.',
+           f'contiguous same-sign qualifying bars collapse into one episode (tolerance '
+           f'{tr.CONTIGUOUS_TOLERANCE} bar)']
+    _write_with_header(path, ter, hdr)
+    _write_with_header(os.path.join(out, 'terrain_summary.csv'), summary, hdr)
+    _write_with_header(os.path.join(out, 'terrain_hour_profile.csv'), hours, hdr)
+    print(f'  TERRAIN — {len(ter)} episodes across {len(summary)} grid cells | eligible bars {elig:,}')
+    for _i, r in summary.iterrows():
+        print(f"    W={int(r['W']):2} K=p{int(r['K_pct'] * 100)} E=p{int(r['E_pct'] * 100)} | "
+              f"{int(r['episodes']):5} episodes | up {int(r['up']):5} ({r['up_share_pct']:4.1f}%) "
+              f"down {int(r['down']):5} ({r['down_share_pct']:4.1f}%) | "
+              f"median {r['median_disp_pts']:7.1f}pt (Q1 {r['q1_disp_pts']:.1f} Q3 {r['q3_disp_pts']:.1f}) "
+              f"| median {int(r['median_duration_bars'])} bars")
+    for ln in tr.render_hour_profile(hours, (15, 0.85, 0.75)):
+        print(ln)
+    print(f'  S2B runtime {secs:.1f}s for one pass over {attest["rows"]:,} bars x '
+          f'{len(summary)} grid cells — single-pass and cheap, so it is NOT chunked and does not '
+          f'consume --workers.')
+    mark_done(out, 'S2B', {'input_sha': input_sha, 'episodes': int(len(ter))})
+    _TERRAIN['cells'] = cells
+    _TERRAIN['terrain'] = ter
+    return {'terrain': ter, 'cells': cells, 'summary': summary, 'hours': hours}
+
+
 # ── S3B PER-FAMILY EVIDENCE REVIEW (spec A.1-A.5) + D2D GATE MEASUREMENT (spec E.1) ──
 def s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
     import cluster_profiler as cp
@@ -504,7 +735,7 @@ def s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, 
     bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
     book = pd.read_csv(bk_path)
     f1_rows = book.index[book['trigger'] == 'F1'].tolist()
-    sigs = score_g.build_book(df, pool, anchor, book)
+    sigs = score_g.build_book(df, pool, anchor, book, adaptive=ad, structural=st)
     conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
     n = len(df)
     U = cp.eligible_universe(df, w)
@@ -562,6 +793,8 @@ def s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, 
     d2d['tolerance_N'] = 5
     d2d['dataset_rows'] = len(df)
     d2d['note'] = 'single-run full gate removal is not computable without editing sacred build_signal_masks; per-direction free runs isolate the jar'
+    months = sorted(set(pd.Series(df['Time'].astype(str).values).str[:7].tolist()))
+    segment_label = f'{months[0]}..{months[-1]}' if months else 'unknown'
     ev_book, bk = cp.book_events(executed)
     f1_names = set()
     if 'signal_idx' in executed.columns:
@@ -569,99 +802,67 @@ def s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, 
     ev_qual, qual_depth = cp.qualifying_events(df, sigs, ad, st, w)
     cs_by_basis = {'basis1': cp.build_cluster_set(n, ev_book, 5),
                    'basis2': cp.build_cluster_set(n, ev_qual, 5)}
+    import family_evidence as fe
     fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, 15, (0.85,), (0.75,))
     ev_thr = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, 'k85')], thr[(ecol, 'e75')], w)
     cs_by_basis['basis3'] = cp.build_cluster_set(n, ev_thr, 5)
-    grid_label = 'basis3 grid W=15 K=p85 E=p75 N=5; depth bands size>=5; eligible mask ADX>=15 & Volume>50 & post-warmup'
+    grid_label = ('basis3 grid W=15 K=p85 E=p75 N=5; depth bands size>=5; eligible mask '
+                  'ADX>=15 & Volume>50 & post-warmup')
+    U = cp.eligible_universe(df, w)
     fam = fe.build_family_evidence(df, bk, qual_depth, cs_by_basis, cs_by_basis['basis3'], U, pool,
-                                   f1_names, _SCANNERS, [os.path.join(_ROOT, 'discovery_results'),
-                                                         os.path.join(_ROOT, 'dots_results'), out], grid_label)
+                                   f1_names, _SCANNERS,
+                                   [os.path.join(out, 'results'), out], grid_label)
     _write_with_header(os.path.join(out, 'family_evidence.csv'), fam, [
         'DOT S3B per-family evidence review (spec A.1)',
         f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
-        f'oracle_sha256_12={oracle_sha}',
-        'LABEL: depth_participation / co_fire_with_F0 / coverage_of_missed / regime_conditional_net are PROPERTY OF THE BOOK.',
-        'LABEL: thrust-episode denominators behind coverage_of_missed are PROPERTY OF THE MARKET (price-only).',
-        f'S5 gate = {fe.S5_GATE}. Cluster tolerance N=5 (spec 0.1.3). Depth band = size>=5.',
-        'INSUFFICIENT-EVIDENCE is a permitted verdict (spec A.1) and is emitted where no output file exists on this dataset.',
-        'No family is assigned a verdict from its historical classification; F13 negative excludes nothing (spec A.3).',
-        'coverage_of_missed is 0.0 BY CONSTRUCTION for F0 and F1: they are the incumbent book, so the episodes they',
-        'touch are the traded set by definition. The column is informative only for a family outside the book.',
-        'rows_emitted=0 for F0 means no F0 results file exists on this dataset; its columns are measured from the',
-        'committed executed-trade table instead, which is stated in verdict_basis.'])
+        'LABEL: depth_participation / co_fire_with_F0 / coverage_of_missed are PROPERTY OF THE BOOK.',
+        'LABEL: thrust-episode denominators are PROPERTY OF THE MARKET (price-only).',
+        f'S5 gate = {fe.S5_GATE}. Cluster tolerance N=5. Depth band = size>=5.',
+        'INSUFFICIENT-EVIDENCE is a permitted verdict and is emitted where no output exists.',
+        'coverage_of_missed is EMPTY BY CONSTRUCTION for F0 and F1: they are the incumbent book.'])
     cl, mix = fe.cross_family_cofiring(bk, f1_names, 5, n)
     if len(mix):
         _write_with_header(os.path.join(out, 'cross_family_cofiring.csv'), mix, [
             'DOT S3B cross-family co-firing (spec A.4) — PROPERTY OF THE BOOK',
-            f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
-            'population = BOOK (F0+F1 executed, gap fillers excluded). Tolerance N=5.',
-            'Only two families are present in the committed book (F0, F1), so "mixed-family" here means F0+F1.',
-            'A wider cross-family test requires F2-F9/F11 outputs, which do not exist on this dataset.'])
-    _write_with_header(os.path.join(out, 'd2d_gate_measurement.csv'), d2d, [
-        'DOT S3B D2D gate measurement (spec E.1, the four-part protocol) — PROPERTY OF THE BOOK',
-        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]}',
-        f'oracle_sha256_12={oracle_sha}',
-        'THE GATE IS NOT REMOVED AND ITS OUTCOME IS NOT PRE-JUDGED. This measures; it does not decide.',
-        'Variants are D2D_Trend_Dir STATE COLUMN changes only; no bar deleted, no engine logic altered.',
-        'LIMIT: a single-run full removal across both directions is not computable without editing sacred',
-        'build_signal_masks (one column cannot satisfy ==+1 and ==-1 on the same bar). The per-direction',
-        'free runs are exact within their direction but isolate the jar. Resolving measurement: an authorised',
-        'd2d_gate=on/off parameter on run_portfolio, which requires documented human authorisation.',
-        'Bucketing = calendar month (spec H.3 primary rule), reported per bucket AND aggregate.'])
-    mark_done(out, 'S3B', {'input_sha': input_sha, 'families': len(fam)})
+            f'dataset_rows={attest["rows"]}',
+            'population = BOOK (F0+F1 executed, gap fillers excluded). Tolerance N=5.'])
     print(f'  families reviewed: {len(fam)} | SELECTABLE {(fam.verdict == "SELECTABLE").sum()} | '
           f'INSUFFICIENT-EVIDENCE {(fam.verdict == "INSUFFICIENT-EVIDENCE").sum()}')
-    print(f'  D2D variants scored: {d2d.variant.nunique()} | rows {len(d2d)}')
+    mark_done(out, 'S3B', {'input_sha': input_sha, 'families': len(fam)})
     return {'family': fam, 'd2d': d2d, 'mixed': mix, 'executed': executed, 'sigs': sigs}
 
 
-def _write_with_header(path, frame, header_lines):
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        for ln in header_lines:
-            f.write(f'# {ln}\n')
-        frame.to_csv(f, index=False, lineterminator='\n')
-    os.replace(tmp, path)
+def _no_constraint(_d, _ss):
+    return True, ''
 
 
-# ── S5B SELECTION LAYER (spec C, D.1-D.2, G, H) ──
 def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
     import cluster_profiler as cp
     import selection as sel
+    import terrain as tr
     import portfolio_simulation_engine as engine
     import score_g
+    import sequential_temporal as seqmod
     import conviction as C
+    import numpy as np
     oracle_sha = sha12(os.path.join(_ENGINE, 'dots_thresholds.py'))
     print(f'  oracle dots_thresholds.py sha256 : {oracle_sha}')
     print(f'  dataset: {attest["rows"]:,} rows | {attest["range"]}')
-    if is_done(out, 'S5B', input_sha) and os.path.exists(os.path.join(out, 'selection_constraints.csv')):
-        print('  S5B already complete for this input (checkpoint) — resuming past it.')
-        return None
+    cand = os.path.join(out, 'results', 'candidates.csv')
+    exercised = os.path.exists(cand)
     n = len(df)
+    months = sorted(set(pd.Series(df['Time'].astype(str).values).str[:7].tolist()))
+    segment_label = f'{months[0]}..{months[-1]}' if months else 'unknown'
     U = cp.eligible_universe(df, w)
-    months = sel.segment_months(df['Time'].values)
-    segment_label = f'{months[w]}..{months[-1]}'
     hyg, dead, canonical, live = sel.vocabulary_hygiene(pool, U, segment_label)
-    _write_with_header(os.path.join(out, 'selection_vocabulary_hygiene.csv'), hyg, [
-        'DOT S5B spec G.1 vocabulary hygiene — PROPERTY OF THE VOCABULARY (not of any book)',
-        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]} segment={segment_label}',
-        f'oracle_sha256_12={oracle_sha}',
-        'ORDER IS BINDING: dead conditions excluded BEFORE equivalence classes are formed.',
-        'SCOPE IS BINDING: derived on the ACTIVE SEGMENT eligible universe, never hardcoded.',
-        'Dead conditions are EXCLUDED FROM RANKING AND TRIPLE FORMATION, never deleted from the vocabulary.'])
     bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
-    sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path))
+    sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path), adaptive=ad, structural=st)
     conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
-    full = engine.run_portfolio(df, sigs, adaptive=ad, structural=st, warmup=w, verbose=False, conviction=conv)
-    bk = full[~full['signal_name'].isin(cp.GAP_NAMES)]
+    full = engine.run_portfolio(df, sigs, adaptive=ad, structural=st, warmup=w, verbose=False,
+                               conviction=conv)
+    ev_book, bk = cp.book_events(full)
     daily = sel.per_signal_daily(bk)
     smap = sel.daily_series_map(daily)
-    daily_provenance = ('per-trade derivation from the committed executed-trade table; this is the ONLY derivation, '
-                        'there is no primary/fallback pair. POPULATION WARNING, pinned before Build 3: the S6 artifact '
-                        'signal_per_day_pnl.jsonl contains only gate-passing signals, whereas this derivation covers '
-                        'the full book. Switching to read the artifact would CHANGE THE POPULATION and therefore change '
-                        'TailDep, FailConc, mCVaR and every bound derived from them. Any such switch is a spec question, '
-                        'not a build decision.')
     names = sorted(smap.keys())
     pairs = sel.pair_tail_dependence(smap, names)
     tstats = sel.tail_dep_book(pairs)
@@ -675,40 +876,33 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
     fd = full.copy()
     fd['day'] = pd.Series(fd['exit_time'].astype(str).values).str[:10].values
     surv = sel.absolute_survival(fd.groupby('day')['pnl'].sum().values)
+    bar_day = pd.Series(df['Time'].astype(str).values).str[:10].values
+    tdays = sel.entry_basis_traded_days(bk, bar_day)
     ent = {1: bk[bk['direction'] == 'LONG']['entry_bar'].values,
            -1: bk[bk['direction'] == 'SHORT']['entry_bar'].values}
     sgn = {1: bk[bk['direction'] == 'LONG']['signal_name'].nunique(),
            -1: bk[bk['direction'] == 'SHORT']['signal_name'].nunique()}
-    bar_day = pd.Series(df['Time'].astype(str).values).str[:10].values
-    tdays = sel.entry_basis_traded_days(bk, bar_day)
-    tdays_exit_basis = int(pd.Series(bk['exit_time'].values).str[:10].nunique())
     grid = sel.depth_yield_grid(ent, sgn, tdays)
-    _write_with_header(os.path.join(out, 'selection_depthyield_grid.csv'), grid, [
-        'DOT S5B spec C.1 DepthYield — PROPERTY OF THE BOOK (incumbent reference)',
-        f'dataset_rows={attest["rows"]} segment={segment_label} traded_days_entry_basis={tdays} '
-        f'traded_days_exit_basis={tdays_exit_basis}',
-        f'traded-day denominator = {tdays} on the BOOK ENTRY-BAR basis (clusters are built from entry bars, so the entry',
-        'basis is the coherent pairing and matches spec C.1). The exit-basis count is emitted alongside for contrast.',
-        'THIS ALIGNMENT APPLIES TO DepthYield ONLY. Spec H.2 resamples from ALL post-warmup trading days in the series,',
-        'not the book footprint, and changing that pool to a traded-day count would reintroduce the incumbency bias',
-        'H.2 exists to avoid.',
-        'DepthYield is a PAIR (LONG, SHORT), evaluated within direction and normalised by that direction',
-        'signal count. IT IS NEVER SUMMED. S is reported over {3,4,5,6,7}; default 5. N=5 fixed (spec 0.1.3),',
-        'N=10 emitted as mandatory sensitivity. Raw and normalised ratios shown beside the signal-count ratio.'])
-    _write_with_header(os.path.join(out, 'selection_mcvar.csv'), mc, [
-        'DOT S5B spec C.2 mCVaR per signal — PROPERTY OF THE BOOK (incumbent reference)',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        'mCVaR = CVaR / signal lot share. More negative = worse tail concentration.',
-        f'C_max = 10th percentile of the incumbent mCVaR distribution (= 90th percentile of tail severity) = {round(c_max, 2)}',
-        'Constraint direction: a candidate fails if its worst mCVaR is BELOW C_max.'])
     h3 = sel.h3_within_direction(bk)
+    base_hdr = [f'dataset_rows={attest["rows"]} segment={segment_label}',
+                f'oracle_sha256_12={oracle_sha}']
+    _write_with_header(os.path.join(out, 'selection_vocabulary_hygiene.csv'), hyg, [
+        'DOT S5B spec G.1 vocabulary hygiene — PROPERTY OF THE VOCABULARY (not of any book)'] +
+        base_hdr + ['dead conditions excluded BEFORE equivalence classes are formed; domain is the '
+                    'ACTIVE SEGMENT eligible universe, never hardcoded.'])
+    _write_with_header(os.path.join(out, 'selection_depthyield_grid.csv'), grid, [
+        'DOT S5B spec C.1 DepthYield — PROPERTY OF THE BOOK'] + base_hdr +
+        [f'traded-day denominator = {tdays} on the BOOK ENTRY-BAR basis (spec C.1).',
+         'DepthYield is a PAIR (LONG, SHORT), normalised within direction. IT IS NEVER SUMMED.'])
+    _write_with_header(os.path.join(out, 'selection_mcvar.csv'), mc, [
+        'DOT S5B spec C.2 mCVaR per signal — PROPERTY OF THE BOOK'] + base_hdr +
+        [f'C_max = 10th percentile of the incumbent mCVaR distribution = {round(c_max, 2)}',
+         'more negative = worse tail concentration; a candidate fails if its worst mCVaR is BELOW C_max.'])
     _write_with_header(os.path.join(out, 'selection_h3_persistence.csv'), h3, [
-        'DOT S5B spec H.3 / H.3.1 regime-conditional persistence — PROPERTY OF THE BOOK',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        'RULE not literal: calendar month, whatever count the segment contains; positive in all but at most one;',
-        'MINIMUM 3 BUCKETS or the criterion is UNEVALUABLE and the build fails loudly rather than passing silently.',
-        'H.3.1: buckets are evaluated WITHIN direction. A thin short sample is reported UNEVALUABLE and the signal',
-        'is NEITHER passed NOR culled on that basis. No rule may remove the last short signal without a named line.'])
+        'DOT S5B spec H.3 / H.3.1 regime-conditional persistence — PROPERTY OF THE BOOK'] + base_hdr +
+        ['RULE not literal: calendar month, positive in all but at most one, MINIMUM 3 BUCKETS or '
+         'UNEVALUABLE. Buckets are evaluated WITHIN direction; a thin direction is reported '
+         'UNEVALUABLE and is NEITHER passed NOR culled.'])
     con = pd.DataFrame([
         {'quantity': 'F_max (FailConc bound)', 'value': round(f_max, 4), 'source': 'incumbent FailConc on ACTIVE SEGMENT'},
         {'quantity': 'TailDep (incumbent)', 'value': round(tstats['TailDep'], 4), 'source': f"tau={sel.TAU} MIN_SHARED={sel.MIN_SHARED}"},
@@ -716,44 +910,64 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
         {'quantity': 'kappa (incumbent/null)', 'value': round(kappa, 4), 'source': 'T_max = kappa * TailDep_null(segment); dimensionless'},
         {'quantity': 'C_max (mCVaR bound)', 'value': round(c_max, 2), 'source': 'p10 of incumbent mCVaR on ACTIVE SEGMENT'},
         {'quantity': 'worst modelled day (FULL)', 'value': round(surv['worst_modelled_day'], 1), 'source': 'absolute survival, evaluated independently of the relative bounds'},
-        {'quantity': 'allowed worst day', 'value': surv['allowed_worst_day'], 'source': f"FTMO ceiling {surv['ceiling']} x margin {surv['margin_frac']}"},
         {'quantity': 'absolute survival passes', 'value': surv['passes'], 'source': 'FULL population (book + gap fillers)'},
         {'quantity': 'retention_pct', 'value': tstats['retention_pct'], 'source': 'share of pair space entering TailDep'},
-        {'quantity': 'mean_lambda_excluded', 'value': round(tstats['mean_lambda_excluded'], 4), 'source': 'raw, includes degenerate k<3 pairs'},
-        {'quantity': 'mean_lambda_excluded_k_ge3', 'value': round(tstats['mean_lambda_excluded_k_ge3'], 4), 'source': 'degeneracy-guarded'},
-        {'quantity': 'exclusion_bias', 'value': tstats['exclusion_bias'], 'source': 'raw'},
         {'quantity': 'exclusion_bias_degeneracy_guarded', 'value': tstats['exclusion_bias_degeneracy_guarded'], 'source': 'k>=3 only'},
-        {'quantity': 'degenerate_excluded_pairs_k_lt3', 'value': tstats['degenerate_excluded_pairs_k_lt3'], 'source': 'lambda mechanically 1/tau at k=1'},
-        {'quantity': 'below_floor_majority_flag', 'value': tstats['below_floor_majority_flag'], 'source': 'fires if >50% of pairs below MIN_SHARED'},
-        {'quantity': 'FailCorr Pearson (REPORTED ONLY)', 'value': round(tstats['FailCorr_pearson_reported_only'], 4), 'source': 'never a constraint; retained so the divergence stays visible'},
+        {'quantity': 'FailCorr Pearson (REPORTED ONLY)', 'value': round(tstats['FailCorr_pearson_reported_only'], 4), 'source': 'never a constraint'},
         {'quantity': 'H.2 resampling pool (post-warmup trading days)', 'value': int(pd.Series(df['Time'].astype(str).values[w:]).str[:10].nunique()), 'source': 'the market, NOT the incumbent footprint'},
-        {'quantity': 'H.2 days the incumbent traded', 'value': tdays, 'source': 'reported for contrast only; NOT the pool'},
     ])
     con['segment'] = segment_label
-    con['population'] = 'BOOK for F_max/TailDep/C_max; FULL for absolute survival'
     _write_with_header(os.path.join(out, 'selection_constraints.csv'), con, [
-        'DOT S5B spec C.2 / C.3 constraint references — computed on the ACTIVE TRAINING SEGMENT',
-        f'dataset_rows={attest["rows"]} dataset_range={attest["range"]} segment={segment_label}',
-        f'oracle_sha256_12={oracle_sha}',
-        'F_max, T_max and C_max are SEGMENT-LOCAL. Full-series values are reporting references ONLY and never',
-        'enter a constraint; that is what keeps the spec I walk-forward valid.',
-        'The absolute survival bound is evaluated on the FULL population INDEPENDENTLY of the relative bounds,',
-        'because a purely relative bar certifies only no-worse-than-incumbent and would certify an incumbent fault.',
-        f'daily-loss series provenance: {daily_provenance}',
-        'RESIDUAL LIMITATION: the pairwise tail structure is measured on a MAJORITY BUT NOT ALL of the pair space,',
-        'retention remains associated with fire frequency, and per-pair lambda is coarse. TailDep is a real but',
-        'IMPRECISE constraint and must not be read as more precise than the data supports. Where TailDep and',
-        'FailConc disagree, FailConc and the absolute bound carry the decision.'])
-    tdays_check = int(pd.Series(sel.trading_days(bk['exit_time'].values)).nunique())
+        'DOT S5B spec C.2 / C.3 constraint references — computed on the ACTIVE TRAINING SEGMENT'] +
+        base_hdr + ['F_max, T_max and C_max are SEGMENT-LOCAL; full-series values are reporting '
+                    'references only and never enter a constraint.',
+                    'The absolute survival bound is evaluated on the FULL population INDEPENDENTLY '
+                    'of the relative bounds.'])
+    cell = (15, 0.85, 0.75)
+    if _TERRAIN.get('cells'):
+        cs_thr = _TERRAIN['cells'][cell]
+        terrain_src = 'S2B MARKET TERRAIN (fixed denominator, identical for every candidate book)'
+    else:
+        cs_thr = tr.build_terrain(df, w)[1][cell]
+        terrain_src = ('S2B MARKET TERRAIN rebuilt in-process by terrain.build_terrain — the SAME '
+                       'construction and grid S2B writes, so the denominator is identical')
+    covdir = sel.coverage_by_direction(ev_book, cs_thr, label='INCUMBENT BOOK')
+    covdir['W'] = cell[0]
+    covdir['K_pct'] = cell[1]
+    covdir['E_pct'] = cell[2]
+    covdir['terrain_source'] = terrain_src
+    _write_with_header(os.path.join(out, 'selection_coverage.csv'), covdir, [
+        'DOT S5B REACH — coverage of the S2B MARKET TERRAIN, scored PER DIRECTION'] + base_hdr +
+        [f'terrain source: {terrain_src}',
+         f'grid cell W={cell[0]} K=p{int(cell[1] * 100)} E=p{int(cell[2] * 100)} | mask {tr.eligibility_label()}',
+         'terrain = MARKET (price only, no signals); entries = BOOK. The denominator is FIXED.',
+         'PER DIRECTION IS THE POINT: the terrain is near 50/50, so a long-heavy book leaves nearly '
+         'all short episodes uncovered and short candidates gain marginal value with NO quota, NO '
+         'floor and NO minimum count anywhere in the objective.',
+         'COVERAGE NEVER OVERRIDES SURVIVAL: it stays after survival, FailConc and DepthYield in the '
+         'lexicographic order (spec C.3), never promoted. A book could reach 100% by taking '
+         'everything; that must remain unreachable.',
+         'COVERAGE COUNTS PRESENCE, NOT CAPTURE: a signal firing at bar 55 of a 60-bar episode counts '
+         'as covering it while earning almost nothing. entry_pos_median is DESCRIPTIVE only; no taper '
+         'is built on it because normalised position needs the episode end, unknowable at fire time.',
+         tr.FORWARD_LOOKING_BOUNDARY])
+    for _i, r in covdir.iterrows():
+        print(f"    REACH {r['direction']:<5} {r['coverage_pct']:6.3f}% of {int(r['terrain_episodes']):5} "
+              f"terrain episodes ({int(r['touched'])} touched, {int(r['missed'])} missed)", flush=True)
+    both = covdir[covdir['direction'].str.startswith('BOTH')]
+    cov = {'episodes': int(both['terrain_episodes'].iloc[0]) if len(both) else 0,
+           'coverage_pct': float(both['coverage_pct'].iloc[0]) if len(both) else 0.0,
+           'by_direction': covdir}
     ent_map = {}
     for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
-        ent_map[d] = {nm: g['entry_bar'].values for nm, g in bk[bk['direction'] == lab].groupby('signal_name')}
+        ent_map[d] = {nm: g['entry_bar'].values
+                      for nm, g in bk[bk['direction'] == lab].groupby('signal_name')}
 
     def _setval(d, sset):
         if not sset:
             return 0.0
         bars = np.concatenate([ent_map[d][x] for x in sset])
-        v, _g = sel.depth_yield_direction(bars, len(sset), tdays_check, sel.S_DEFAULT, sel.N_TOLERANCE)
+        v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT, sel.N_TOLERANCE)
         return v
 
     def _gain(d, selected, cid):
@@ -765,91 +979,82 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
     fx = []
     for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
         ids = sorted(ent_map[d].keys())
+        if len(ids) < 2:
+            continue
         mk = 3 if len(ids) <= 15 else 2
         f = sel.exhaustive_vs_greedy(d, ids, _setval, _gain, _nocon, max_k=mk)
         f['direction_label'] = lab
         fx.append(f)
-    fixture = pd.concat(fx, ignore_index=True)
-    _write_with_header(os.path.join(out, 'selection_fixture_exhaustive_vs_greedy.csv'), fixture, [
-        'DOT S5B standing fixture: EXHAUSTIVE vs GREEDY on the incumbent, BOTH directions',
-        f'dataset_rows={attest["rows"]} segment={segment_label} traded_days={tdays_check}',
-        f'objective = DepthYield_d at S={sel.S_DEFAULT}, N={sel.N_TOLERANCE}, normalised by that direction signal count',
-        'THE FIXTURE POOL IS THE INCUMBENT BOOK 50 SIGNALS. THIS IS NOT A BOOK SELECTION AND MUST NOT BE READ AS ONE.',
-        'It is a canary for the stopping-rule failure class: DepthYield is NON-MONOTONE in set size, and a search',
-        'halting on the first non-positive SINGLE gain halts at |S|=1 having evaluated no set of size >=2.',
-        'RESTRICTION IS PART OF THE FINDING: exhaustive enumeration is to max_k_enumerated plus the all-signals set;',
-        'sizes between max_k and all are NOT enumerated, so exhaustive_optimum is a lower bound on the true optimum.',
-        'greedy_pct_of_optimum is measured against that lower bound.'])
-    cofire_rows = []
-    for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
-        nm = sorted(ent_map[d].keys())
-        masks = []
-        for x in nm:
-            mm = np.zeros(n, dtype=bool)
-            mm[ent_map[d][x].astype(np.int64)] = True
-            masks.append(mm)
-        if len(masks) >= 2:
-            M = sel.cofire_matrix(masks, nm)
-            cofire_rows.append({'direction': lab, 'signals': len(nm), 'CoFire_mean': round(sel.cofire_book_all_pairs_DIAGNOSTIC(M), 6),
-                                'basis': 'executed entry bars (incumbent fixture)'})
+    fixture = pd.concat(fx, ignore_index=True) if fx else pd.DataFrame()
+    if len(fixture):
+        _write_with_header(os.path.join(out, 'selection_fixture_exhaustive_vs_greedy.csv'),
+                           fixture, ['DOT S5B STANDING CANARY - exhaustive vs greedy, BOTH directions, every run'] + base_hdr + [FIXTURE_WHY, FIXTURE_LIMIT])
+        for _i, r in fixture[fixture['argmax'].str.startswith('GREEDY')].iterrows():
+            print(f"    CANARY {r['direction_label']:<5} greedy {r['greedy_value']:.6f} = "
+                  f"{r['greedy_pct_of_optimum']}% of enumerated optimum "
+                  f"{r['exhaustive_optimum']:.6f} (optimum at size "
+                  f"{int(r['optimum_at_size'])}, pair escapes {int(r['pair_escapes'])})", flush=True)
+    pivot = daily.pivot_table(index='day', columns='signal_name', values='pnl',
+                              aggfunc='sum').fillna(0.0)
+    pbo = sel.pbo_cscv(pivot.values) if pivot.shape[0] >= 16 and pivot.shape[1] >= 2 else float('nan')
+    merged_state = {'survival': surv, 'FailConc': f_max, 'TailDep': tstats['TailDep'],
+                    'worst_mCVaR': float(np.nanmin(mc['mCVaR']))}
+    bounds = {'F_max': f_max, 'T_max': kappa * null['TailDep_null_mean'], 'C_max': c_max}
+    con_eval = sel.evaluate_constraints(merged_state, bounds)
+    ce = pd.DataFrame([{'applied_to': 'INCUMBENT BOOK (self-reference)',
+                        **{k: str(v) for k, v in con_eval.items()},
+                        'PBO_cscv_reported_not_enforced': round(pbo, 4) if pbo == pbo else '',
+                        'PBO_reference_bar': 0.10}])
+    _write_with_header(os.path.join(out, 'selection_constraint_evaluation.csv'), ce,
+                       ['DOT S5B spec C.3 constraint evaluation + spec H.1 PBO via CSCV'] + base_hdr + [PBO_WHY])
+    print(f"    PBO (CSCV, reported not enforced, bar 0.10) = "
+          f"{round(pbo, 4) if pbo == pbo else 'n/a'} | constraints "
+          f"{con_eval['binding'] or 'all pass'}", flush=True)
     vz = df['Volume'].values == 0
-    fri = (df['EST_DayOfWeek'].values == 5) & ((df['EST_Hour'].values > 16) |
-                                               ((df['EST_Hour'].values == 16) & (df['EST_Minute'].values >= 45)))
-    entry_ok_true = (df['ADX_Value'].values >= 15) & (df['Volume'].values > 50) & ~vz & ~fri & (np.arange(n) >= w)
-    qmasks, qdirs, qnames = engine.build_signal_masks(df, sigs, ad, st, entry_ok_true, verbose=False)
+    fri = ((df['EST_DayOfWeek'].values == 5)
+           & ((df['EST_Hour'].values > 16)
+              | ((df['EST_Hour'].values == 16) & (df['EST_Minute'].values >= 45))))
+    entry_ok = ((df['ADX_Value'].values >= 15) & (df['Volume'].values > 50) & ~vz & ~fri
+                & (np.arange(n) >= w))
+    qmasks, qdirs, qnames = engine.build_signal_masks(df, sigs, ad, st, entry_ok, verbose=False)
     Mq = sel.cofire_matrix(qmasks, qnames)
     qd = np.array(qdirs)
     offm = ~np.eye(len(qnames), dtype=bool)
-    samem = (qd[:, None] == qd[None, :]) & offm
-    crossm = (qd[:, None] != qd[None, :]) & offm
-    cofire_rows.append({'direction': 'ALL ordered pairs (pre-jar qualifying, spec C.1 literal)', 'signals': len(qnames),
-                        'CoFire_mean': round(float(Mq[offm].mean()), 6),
-                        'basis': f'pre-jar qualifying masks with the engine true entry_ok; {int(offm.sum())} ordered pairs'})
-    cofire_rows.append({'direction': 'SAME-direction pairs only', 'signals': len(qnames),
-                        'CoFire_mean': round(float(Mq[samem].mean()), 6),
-                        'basis': f'{int(samem.sum())} ordered pairs; the meaningful basis, see cross-direction row'})
-    cofire_rows.append({'direction': 'CROSS-direction pairs only', 'signals': len(qnames),
-                        'CoFire_mean': round(float(Mq[crossm].mean()), 6),
-                        'basis': f'{int(crossm.sum())} ordered pairs; EXACTLY ZERO BY CONSTRUCTION - the D2D gate '
-                                 f'admits a signal only where D2D_Trend_Dir == its direction, so long and short '
-                                 f'qualifying masks are disjoint on every bar'})
+    cofire_rows = []
     for dd, lab in ((1, 'LONG'), (-1, 'SHORT')):
         sd = qd == dd
         sub = Mq[np.ix_(sd, sd)]
         o = ~np.eye(sub.shape[0], dtype=bool)
         if o.sum():
-            cofire_rows.append({'direction': f'{lab}-only pairs (pre-jar qualifying)', 'signals': int(sd.sum()),
+            cofire_rows.append({'basis': lab + '-only ordered pairs (WITHIN direction)',
+                                'signals': int(sd.sum()),
                                 'CoFire_mean': round(float(sub[o].mean()), 6),
-                                'basis': f'{int(o.sum())} ordered pairs within direction'})
+                                'ordered_pairs': int(o.sum())})
+    crossm = (qd[:, None] != qd[None, :]) & offm
+    cofire_rows.append({'basis': 'CROSS-direction ordered pairs (structurally zero)',
+                        'signals': len(qnames),
+                        'CoFire_mean': round(float(Mq[crossm].mean()), 6) if crossm.sum() else 0.0,
+                        'ordered_pairs': int(crossm.sum())})
+    cofire_rows.append({'basis': 'ALL ordered pairs - cofire_book_all_pairs_DIAGNOSTIC (DEFLATED)',
+                        'signals': len(qnames),
+                        'CoFire_mean': round(sel.cofire_book_all_pairs_DIAGNOSTIC(Mq), 6),
+                        'ordered_pairs': int(offm.sum())})
     cof = pd.DataFrame(cofire_rows)
-    _write_with_header(os.path.join(out, 'selection_cofire.csv'), cof, [
-        'DOT S5B spec C.1 entry co-firing — PROPERTY OF THE BOOK (incumbent reference)',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        'cofire(i,j) = |bars where i and j both qualify| / |bars where i qualifies|; CoFire(B) = mean over ordered pairs.',
-        'Entry co-firing is the MAXIMISED axis. It is never combined with the bounded failure-correlation axis.',
-        'STRUCTURAL FINDING: cross-direction cofire is EXACTLY ZERO on every pair, because the D2D gate admits a',
-        'signal only where D2D_Trend_Dir equals its direction, so long and short qualifying masks are disjoint.',
-        'CoFire(B) taken over ALL ordered pairs is therefore mechanically deflated by the long/short composition',
-        '(962 of 2450 ordered pairs are structurally zero on this book). Like DepthYield, it is only meaningful',
-        'WITHIN direction, and all bases are emitted here rather than a single headline number.'])
+    _write_with_header(os.path.join(out, 'selection_cofire.csv'), cof,
+                       ['DOT S5B spec C.1 entry co-firing - PROPERTY OF THE BOOK'] + base_hdr + [COFIRE_WHY])
     Cmat, cnames, edges, gstats = sel.mask_correlation_graph(pool, live, U)
     comms = sel.detect_communities(cnames, edges)
     n90, n95, pr_ratio = sel.effective_dimension(Cmat)
     g2 = pd.DataFrame([{**gstats, 'communities_detected': len(comms),
                         'largest_community': max((len(v) for v in comms.values()), default=0),
                         'effective_dim_90pct': n90, 'effective_dim_95pct': n95,
-                        'participation_ratio': round(pr_ratio, 2),
-                        'resolution': 1.0, 'r_threshold': 0.70}])
-    _write_with_header(os.path.join(out, 'selection_g2_near_duplication.csv'), g2, [
-        'DOT S5B spec G.2 near-duplication, domain bridging and community detection',
-        f'dataset_rows={attest["rows"]} segment={segment_label} live_conditions={len(cnames)}',
-        'MODEST HYGIENE, NOT A REACH MECHANISM. It removes false corroboration in ranking and prevents degenerate',
-        'triples. It does NOT address the spec D.0 coverage gap, where 89.8% of missed thrusts have no qualifying',
-        'signal at all — a vocabulary-content problem no hygiene on the existing conditions can solve.'])
+                        'participation_ratio': round(pr_ratio, 2), 'r_threshold': 0.70}])
+    _write_with_header(os.path.join(out, 'selection_g2_near_duplication.csv'), g2,
+                       ['DOT S5B spec G.2 near-duplication and community detection'] + base_hdr + [G2_WHY])
     bookdf = pd.read_csv(bk_path)
     trows = []
     for _i, r in bookdf.iterrows():
-        if str(r['trigger']) != 'F0':
+        if 'trigger' in bookdf.columns and str(r['trigger']) != 'F0':
             continue
         parts = [x.strip() for x in str(r['signal_def']).split('+')]
         doms = sorted({sel.condition_domain(x) for x in parts})
@@ -857,86 +1062,114 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
                       'domains': ';'.join(doms), 'n_domains': len(doms),
                       'passes_2domain_rule': sel.triple_domain_ok(parts)})
     tdom = pd.DataFrame(trows)
-    _write_with_header(os.path.join(out, 'selection_g2_domain_bridging.csv'), tdom, [
-        'DOT S5B spec G.2 domain-bridging rule applied to the incumbent F0 triples — PROPERTY OF THE BOOK',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        f'rule: a candidate triple must draw from at least {sel.DOMAIN_MIN_DISTINCT} distinct functional domains.',
-        'Applied here RETROSPECTIVELY as a fixture. It is not applied to the committed book and removes nothing.',
-        'Domains are assigned by variable provenance; spec G.2 requires measured communities to govern where the two disagree.'])
-    fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, 15, (0.85,), (0.75,))
-    ev_thr = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, 'k85')], thr[(ecol, 'e75')], w)
-    cs_thr = cp.build_cluster_set(n, ev_thr, sel.N_TOLERANCE)
-    cov = sel.coverage_of_book({1: ent_map[1].get('__none__', np.concatenate(list(ent_map[1].values())) if ent_map[1] else np.array([], dtype=np.int64)),
-                                -1: np.concatenate(list(ent_map[-1].values())) if ent_map[-1] else np.array([], dtype=np.int64)}, cs_thr)
-    covf = pd.DataFrame([{**cov, 'W': 15, 'K_pct': 0.85, 'E_pct': 0.75, 'N': sel.N_TOLERANCE}])
-    _write_with_header(os.path.join(out, 'selection_coverage.csv'), covf, [
-        'DOT S5B spec D.2 Coverage — episodes are MARKET, touched is BOOK',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        'Coverage(B) = fraction of thrust episodes touched by >=1 entry, same direction, entry bar inside the span.',
-        'Single grid cell here as a fixture; spec D.2 requires the full (W,K,E) grid, which S8B emits.'])
-    pivot = daily.pivot_table(index='day', columns='signal_name', values='pnl', aggfunc='sum').fillna(0.0)
-    pbo = sel.pbo_cscv(pivot.values) if pivot.shape[0] >= 16 and pivot.shape[1] >= 2 else float('nan')
-    merged_state = {'survival': surv, 'FailConc': f_max, 'TailDep': tstats['TailDep'],
-                    'worst_mCVaR': float(np.nanmin(mc['mCVaR']))}
-    bounds = {'F_max': f_max, 'T_max': kappa * null['TailDep_null_mean'], 'C_max': c_max}
-    con_eval = sel.evaluate_constraints(merged_state, bounds)
-    ce = pd.DataFrame([{'applied_to': 'INCUMBENT BOOK (self-reference)', **{k: str(v) for k, v in con_eval.items()},
-                        'PBO_cscv_reported_not_enforced': round(pbo, 4) if pbo == pbo else '',
-                        'PBO_reference_bar': 0.10}])
-    _write_with_header(os.path.join(out, 'selection_constraint_evaluation.csv'), ce, [
-        'DOT S5B spec C.3 constraint evaluation applied to the INCUMBENT as a self-reference fixture',
-        f'dataset_rows={attest["rows"]} segment={segment_label}',
-        'SELF-REFERENCE: the incumbent is compared against bounds derived FROM ITSELF, so F_max and TailDep pass by',
-        'construction. The informative cell is mcvar, where C_max is a p10 of the incumbent own distribution and',
-        'roughly a tenth of its signals therefore sit below it. This exercises the code path; it is NOT evidence',
-        'about any candidate book.',
-        'SEPARATE AXES: survival / FailConc / TailDep / mCVaR are evaluated as independent booleans. No composite',
-        'score is formed anywhere. PBO is REPORTED, NOT ENFORCED, on this run per spec H.1.'])
-    cand_path = os.path.join(out, 'results', 'candidates.csv')
-    exercised = os.path.exists(cand_path)
+    if len(tdom):
+        _write_with_header(os.path.join(out, 'selection_g2_domain_bridging.csv'), tdom,
+                           ['DOT S5B spec G.2 domain bridging applied RETROSPECTIVELY to the incumbent F0 triples - PROPERTY OF THE BOOK'] + base_hdr + [TDOM_WHY])
+        print(f"    G.2 {gstats['pairs_ge_070']} pairs at |r|>=0.70 of {gstats['pairs_total']}, "
+              f"median |r| {round(gstats['median_abs_r'], 4)}, {n90} components carry 90% variance, "
+              f"{len(comms)} communities | domain bridging "
+              f"{int(tdom['passes_2domain_rule'].sum())} of {len(tdom)} triples span >= 2 domains",
+              flush=True)
     report_lines = [
         f'vocabulary: {hyg["vocabulary_total"].iloc[0]} total, {hyg["dead_conditions"].iloc[0]} dead, '
-        f'{hyg["exact_duplicate_pairs"].iloc[0]} exact-duplicate pairs, {hyg["effective_vocabulary"].iloc[0]} effective '
-        f'(identity domain = eligible universe, {int(U.sum()):,} bars)',
-        f'incumbent reference DepthYield at N=5 S=5: LONG {grid[(grid.N==5)&(grid.S==5)]["DepthYield_LONG"].iloc[0]:.5f} / '
-        f'SHORT {grid[(grid.N==5)&(grid.S==5)]["DepthYield_SHORT"].iloc[0]:.5f} (pair, never summed)',
-        f'constraint references (segment {segment_label}): F_max {round(f_max,3)}, kappa {round(kappa,3)}, C_max {round(c_max,1)}, '
-        f'absolute survival {"PASS" if surv["passes"] else "FAIL"} at worst day {round(surv["worst_modelled_day"],1)}',
-        f'H.3 within direction: ' + '; '.join(f"{r['direction']} {r['verdict']} ({r['positive']}/{r['buckets']} buckets)" for _i, r in h3.iterrows()),
-        'submodularity: NOT established; greedy is used as a heuristic and the (1-1/e) bound is NOT claimed anywhere',
-        'NO DIRECTIONAL TARGET: no floor, quota, target, minimum signal count or reserved allocation exists in '
-        'selection.py; each direction stops on its own marginal gain or its own binding constraint and may terminate with zero signals',
+        f'{hyg["effective_vocabulary"].iloc[0]} effective (identity domain = eligible universe)',
+        f'constraint references (segment {segment_label}): F_max {round(f_max, 3)}, kappa '
+        f'{round(kappa, 3)}, C_max {round(c_max, 1)}, absolute survival '
+        f'{"PASS" if surv["passes"] else "FAIL"} at worst day {round(surv["worst_modelled_day"], 1)}',
+        'H.3 within direction: ' + '; '.join(f"{r['direction']} {r['verdict']}" for _i, r in h3.iterrows()),
+        'submodularity: NOT established; greedy is a heuristic and the (1-1/e) bound is NOT claimed',
+        'NO DIRECTIONAL TARGET: no floor, quota, target or reserved allocation exists in selection.py',
     ]
+    if exercised:
+        cands = pd.read_csv(cand)
+        print(f'  SELECTION SEARCH over {len(cands)} candidates — per-direction greedy/CELF with '
+              f'the lookahead-2 stopping rule, subject to the constraint references above.')
+        entry_ok_sel = ((df['ADX_Value'].values >= 15) & (df['Volume'].values > 50)
+                        & (df['Volume'].values != 0) & (np.arange(n) >= w))
+        cand_bars = {1: {}, -1: {}}
+        skipped = 0
+        for _i, cr in cands.iterrows():
+            fam = str(cr.get('family', '')).strip()
+            sig = str(cr.get('signal_def', ''))
+            d = 1 if str(cr.get('direction', 'LONG')).upper() == 'LONG' else -1
+            key = f'{fam}|{sig}|{"LONG" if d == 1 else "SHORT"}'
+            if key in cand_bars[d]:
+                continue
+            try:
+                if fam == 'F0':
+                    parts = [x.strip().rsplit(':', 1) for x in sig.split('+')]
+                    mk = np.ones(n, dtype=bool)
+                    for f_, t_ in parts:
+                        mk &= np.asarray(engine.condition_mask(df, f_, t_, ad, st), dtype=bool)
+                elif fam == 'F1':
+                    mm = score_g._F1.match(sig)
+                    mk = np.asarray(seqmod.pair_mask(pool[mm.group(1).strip()],
+                                                     pool[mm.group(3).strip()],
+                                                     int(mm.group(2)), anchor), dtype=bool)
+                else:
+                    mk = np.asarray(score_g.family_mask(df, pool, fam, sig, ad, st), dtype=bool)
+            except SystemExit:
+                skipped += 1
+                continue
+            cand_bars[d][key] = np.flatnonzero(mk & entry_ok_sel).astype(np.int64)
+        print(f'  candidate entry masks built: LONG {len(cand_bars[1])} | SHORT {len(cand_bars[-1])}'
+              + (f' | {skipped} unparseable skipped' if skipped else ''))
+
+        def _dy(d, sset):
+            if not sset:
+                return 0.0
+            bars = np.concatenate([cand_bars[d][x] for x in sset])
+            v, _g = sel.depth_yield_direction(bars, len(sset), tdays, sel.S_DEFAULT,
+                                              sel.N_TOLERANCE)
+            return v
+
+        def _sel_gain(d, selected, cid):
+            return _dy(d, list(selected) + [cid]) - _dy(d, list(selected))
+
+        def _sel_setgain(d, selected, add):
+            return _dy(d, list(selected) + list(add)) - _dy(d, list(selected))
+
+        chosen = {}
+        stops = {}
+        for d, lab in ((1, 'LONG'), (-1, 'SHORT')):
+            ids = sorted(cand_bars[d].keys())
+            if not ids:
+                chosen[d] = []
+                stops[d] = 'no candidates in this direction'
+                continue
+            picked, reason, log, meta = sel.greedy_direction(
+                d, ids, _sel_gain, _no_constraint, set_gain_fn=_sel_setgain)
+            chosen[d] = picked
+            stops[d] = reason
+            print(f'    {lab}: selected {len(picked)} of {len(ids)} candidates | '
+                  f'pair escapes {meta["pair_escapes"]} | stop: {reason[:80]}')
+        admitted = {lab: list(chosen[d]) for d, lab in ((1, 'LONG'), (-1, 'SHORT'))}
+        print(f'  ADMISSION ORDER retained IN MEMORY ONLY for item 12\'s dilution curve: '
+              f'LONG {len(admitted["LONG"])} / SHORT {len(admitted["SHORT"])}. '
+              f'NO selected_book.csv is written. Item 15: the catalogue is emitted from VALID, '
+              f'never from an argmax, so no argmax output is persisted anywhere. greedy_direction '
+              f'survives as the dilution-curve admission loop and nothing else consumes it.')
+        report_lines.append(
+            f'ADMISSION ORDER computed in memory for the dilution curve from {len(cands)} '
+            f'candidates (LONG {len(chosen[1])} / SHORT {len(chosen[-1])}). NO selected book is '
+            f'written: item 15 forbids emitting a catalogue from an argmax.')
     if not exercised:
-        report_lines.append('SELECTION NOT RUN: no candidates.csv on this run. S3 discovery has never been executed, so the '
-                            'candidate pool does not exist. The objective, search, constraints and hygiene are built and '
-                            'unit-exercised against the committed book as a fixture; end-to-end selection is UNEXERCISED PENDING S3.')
-    fxs = fixture[fixture['argmax'].str.startswith('GREEDY')]
-    for _i, r in fxs.iterrows():
-        report_lines.append(f"fixture exhaustive-vs-greedy {r['direction_label']}: greedy {r['greedy_value']:.6f} = "
-                            f"{r['greedy_pct_of_optimum']}% of enumerated optimum {r['exhaustive_optimum']:.6f} "
-                            f"(optimum at size {r['optimum_at_size']}, pair escapes {r['pair_escapes']}) "
-                            f"— INCUMBENT FIXTURE, NOT A BOOK SELECTION")
-    report_lines.append(f"stopping rule = 'no addition of size <= 2 improves', direction-agnostic, evaluated at every "
-                        f"potential termination point; escape looks ahead 2 elements and a plateau escapable only by a "
-                        f"simultaneous 3+ addition still halts")
-    report_lines.append("CoFire (pre-jar qualifying, engine entry_ok): all-pairs "
-                        f"{cof[cof.direction.str.startswith('ALL ordered')]['CoFire_mean'].iloc[0]}, same-direction "
-                        f"{cof[cof.direction.str.startswith('SAME')]['CoFire_mean'].iloc[0]}, cross-direction "
-                        f"{cof[cof.direction.str.startswith('CROSS')]['CoFire_mean'].iloc[0]} (exactly zero by construction: "
-                        "the D2D gate makes long and short qualifying masks disjoint)")
-    report_lines.append(f"G.2: {gstats['pairs_ge_070']} pairs at |r|>=0.70 of {gstats['pairs_total']}, median |r| "
-                        f"{round(gstats['median_abs_r'],4)}, {n90} components carry 90% variance, "
-                        f"{len(comms)} communities; signed dependence {gstats['signed_positive']} positive / "
-                        f"{gstats['signed_negative']} negative (PRDS fails -> BY not BH)")
-    report_lines.append(f"domain bridging on incumbent F0 triples: {int(tdom['passes_2domain_rule'].sum())} of {len(tdom)} "
-                        f"span >= {sel.DOMAIN_MIN_DISTINCT} domains (retrospective fixture; removes nothing)")
-    report_lines.append(f"Coverage (incumbent, W=15 K=p85 E=p75 N=5) = {cov['coverage_pct']}% of {cov['episodes']} thrust episodes")
-    print(f'  vocabulary {hyg["effective_vocabulary"].iloc[0]} effective | kappa {kappa:.3f} | C_max {c_max:.1f} | '
-          f'survival {"PASS" if surv["passes"] else "FAIL"}')
+        report_lines.append('SELECTION SEARCH NOT RUN: no candidates.csv on this run, so the '
+                            'objective and per-direction greedy were not exercised. The constraint '
+                            'references, hygiene, DepthYield and REACH above are measured on the '
+                            'incumbent as a self-reference.')
+    print(f'  vocabulary {hyg["effective_vocabulary"].iloc[0]} effective | kappa {kappa:.3f} | '
+          f'C_max {c_max:.1f} | survival {"PASS" if surv["passes"] else "FAIL"}')
     print(f'  selection search: {"candidates present" if exercised else "UNEXERCISED PENDING S3 (no candidate pool)"}')
-    mark_done(out, 'S5B', {'input_sha': input_sha, 'effective_vocabulary': int(hyg['effective_vocabulary'].iloc[0])})
-    return {'report_lines': report_lines, 'hygiene': hyg, 'grid': grid, 'constraints': con, 'h3': h3}
+    if not exercised:
+        print('  S5B NOT MARKED DONE — it reported itself unexercised (no candidate pool). A stage '
+              'that did not do its work must not claim it did.')
+    else:
+        mark_done(out, 'S5B', {'input_sha': input_sha,
+                               'effective_vocabulary': int(hyg['effective_vocabulary'].iloc[0])})
+    return {'report_lines': report_lines, 'hygiene': hyg, 'grid': grid, 'constraints': con,
+            'h3': h3, 'coverage': cov}
+
 
 
 def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest):
@@ -991,7 +1224,7 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
     causal = wfs.assert_oracle_causal(df, ad, dt_compute(), splits[0]['train_last_bar'], struct_keys)
     U = cp.eligible_universe(df, w)
     bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
-    sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path))
+    sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path), adaptive=ad, structural=st)
     conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
     full = engine.run_portfolio(df, sigs, adaptive=ad, structural=st, warmup=w, verbose=False, conviction=conv)
     bk = full[~full['signal_name'].isin(cp.GAP_NAMES)]
@@ -1129,12 +1362,27 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
             'from the denominator, matching how the record computes its 27% baseline.'])
     trail = wfs.read_attestation(out)
     repeats, n_rep = wfs.detect_repeats(trail)
-    meta_checks = {'funnel_rerun': False, 'null_per_split': True,
-                   'null_detail': f'the random-triple null is regenerated inside each split from the '
-                                  f'{len(pool_keys)}-condition pool and scored in the same single test pass; '
-                                  f'the record 27% figure is never carried',
-                   'funnel_detail': 'S3 discovery has never run, so no candidate pool exists and the funnel cannot '
-                                    'be re-run per split; the mechanics are built and the criterion is unexercisable'}
+    import discovery_orchestrator as orch
+    _cand = os.path.join(out, 'results', 'candidates.csv')
+    _pool_ok = False
+    _pool_n = 0
+    _pool_why = 'candidates.csv absent'
+    if os.path.exists(_cand):
+        try:
+            _pool_n = len(pd.read_csv(_cand))
+        except Exception as _e:
+            _pool_n = 0
+            _pool_why = f'candidates.csv unreadable: {type(_e).__name__}'
+        if _pool_n > 0:
+            _prov_ok, _prov_why = orch.provenance_is_current(_cand, input_sha)
+            _pool_ok = bool(_prov_ok)
+            _pool_why = ('pool present and current' if _prov_ok
+                         else f'pool present ({_pool_n} rows) but provenance: {_prov_why}')
+        else:
+            _pool_why = 'candidates.csv present but empty'
+    meta_checks = {'funnel_rerun': _pool_ok, 'null_per_split': True,
+                   'funnel_detail': (f'DERIVED, not asserted: {_pool_why}; candidates={_pool_n}; '
+                                     f'input_sha={input_sha}')}
     wfs.assert_no_row_deletion(df, n0)
     pc_pre = pd.DataFrame([{'splits_derived': len(splits)}])
     rej = wfs.rejection_checks(df, n0, splits, meta_checks, causal, guards,
@@ -1214,7 +1462,7 @@ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, 
     else:
         print('  S8B standalone: S8 output unavailable, rebuilding the committed trade list.')
         bk_path = book_file if book_file else os.path.join(_ENGINE, 'book50_signals.csv')
-        sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path))
+        sigs = score_g.build_book(df, pool, anchor, pd.read_csv(bk_path), adaptive=ad, structural=st)
         conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
         _r, executed = _score(df, sigs, ad, st, w, conv, want_trades=True)
     n = len(df)
@@ -1340,7 +1588,8 @@ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, 
         res.to_csv(f, index=False, lineterminator='\n')
     os.replace(tmp, path)
     sm = pd.DataFrame(summary)
-    sm.to_csv(os.path.join(out, 'cluster_basis_summary.csv'), index=False, lineterminator='\n')
+    sm.to_csv(os.path.join(out, 'cluster_basis_summary.csv'), index=False,
+                lineterminator='\n', encoding='utf-8')
     print(f'  wrote {len(res)} rows → {path}')
     mark_done(out, 'S8B', {'input_sha': input_sha, 'rows': int(len(res)), 'conditions': len(pool)})
     return {'rows': int(len(res)), 'conditions': len(pool), 'summary': sm, 'overlaps': overlaps,
@@ -1350,7 +1599,7 @@ def s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, 
 
 
 # ── S9 REPORT + SPLIT ──
-def s9_report(out, attest, contenders, committed, sacred, market_label, chunk_mb, input_sha, profile=None, evidence=None, selection_state=None):
+def s9_report(out, attest, contenders, committed, sacred, market_label, input_sha, profile=None, evidence=None, selection_state=None):
     scored_fresh = 'regenerated fresh this run (S6) — stale 746102aae415 / 0910f360a628 NOT inherited'
     L = []
     L.append(f'# DOT Master Report — {market_label}')
@@ -1431,9 +1680,9 @@ def s9_report(out, attest, contenders, committed, sacred, market_label, chunk_mb
     L.append('')
     rep = os.path.join(out, 'master_report.md')
     open(rep, 'w', encoding='utf-8').write('\n'.join(L) + '\n')
-    nsplit = split_tree(out, chunk_mb)
-    print(f'  report → {rep} | auto-split: {nsplit} oversized artifact(s) chunked (≤{chunk_mb}MB, header-in-part1)')
-    mark_done(out, 'S9', {'input_sha': input_sha, 'split_files': nsplit})
+    print(f'  report -> {rep} | every artifact written as ONE file (item 3: auto-split deleted; '
+          f'the next stage used to read the chopped parts as if they were whole)')
+    mark_done(out, 'S9', {'input_sha': input_sha})
 
 
 def resolve_data(data):
@@ -1454,6 +1703,11 @@ def resolve_book(book):
 
 
 def main():
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description='DOT master orchestrator (S0→S9).')
     ap.add_argument('--data', default='/data')
     ap.add_argument('--out', default=os.path.join(_HERE, 'discovery'))
@@ -1461,7 +1715,13 @@ def main():
     ap.add_argument('--workers', type=int, default=2)
     ap.add_argument('--stage', default=None, choices=STAGES)
     ap.add_argument('--market-label', default='US30 (sealed baseline)')
-    ap.add_argument('--chunk-mb', type=int, default=9)
+    ap.add_argument('--parity', default=None,
+                    help="run the chunking parity harness and exit: a family (e.g. F0) or 'all'")
+    ap.add_argument('--s3-limit', type=int, default=0,
+                    help='bound each family to its first N axis units in S3 (0 = unbounded); for '
+                         'smoke-testing the stage without committing days')
+    ap.add_argument('--parity-limit', type=int, default=200,
+                    help='cap each family to the first N axis units, applied to BOTH parity legs')
     args = ap.parse_args()
     args.workers = min(args.workers, 16)
 
@@ -1470,6 +1730,7 @@ def main():
     print('DOT MASTER ORCHESTRATOR')
     print('═' * 68)
     sacred = verify_sacred()
+    preflight_loader_audit()
     data_dir = resolve_data(args.data)
     book_file = resolve_book(args.book)
     out = args.out
@@ -1480,14 +1741,54 @@ def main():
 
     only = args.stage
     print('\n[S0] INGEST & VALIDATE')
-    df, attest, input_sha = s0_ingest(data_dir, out, args.chunk_mb)
+    df, attest, input_sha = s0_ingest(data_dir, out)
+    bind_ingested_frame_permanently(df, input_sha, os.path.join(out, 'results'))
     print('\n[S1] ADAPTIVE THRESHOLDS (oracle)')
     ad, st = s1_thresholds(df)
     print('\n[S2] POOL & ANCHORS')
     pool, anchor, w = s2_pool(df, ad, st)
 
+    if args.parity:
+        import discovery_orchestrator as orch
+        results = os.path.join(out, 'results')
+        os.makedirs(results, exist_ok=True)
+        orch.RESULTS_DIR = results
+        os.environ['DOT_RESULTS_DIR'] = results
+        fams = None if args.parity.lower() == 'all' else [x.strip().upper()
+                                                         for x in args.parity.split(',')]
+        frame_path = None
+        if args.workers > 1:
+            frame_path = os.path.join(results, f'_parity_frame_{input_sha}.csv')
+            if not os.path.exists(frame_path):
+                tmp = frame_path + '.tmp'
+                with open(tmp, 'w', encoding='utf-8', newline='') as f:
+                    df.to_csv(f, index=False, lineterminator='\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, frame_path)
+        print('\n[PARITY] CHUNKING PARITY HARNESS — pre-flight check, no scan is run')
+        print('  scope=proof (the smaller candidate vocabulary): parity proves a MECHANISM —')
+        print('  that chunked+collated equals unchunked over the SAME bounded range. Full scope')
+        print('  would cost hours per leg and prove nothing further about the mechanism.')
+        ok = orch.parity_check('proof', workers=args.workers, df=df, adaptive=ad, structural=st,
+                               warmup=w, families=fams, limit=args.parity_limit,
+                               frame_path=frame_path)
+        if frame_path and os.path.exists(frame_path):
+            os.remove(frame_path)
+        print('\n' + '=' * 68)
+        print('PARITY PASS — chunking is sound on this dataset; the full scan may be started.'
+              if ok else
+              'PARITY FAIL — a chunked family does NOT reproduce its unchunked result on this '
+              'dataset. DO NOT start the scan; the pool would be wrong.')
+        print('=' * 68)
+        sys.exit(0 if ok else 1)
+
     contenders = committed = profile = evidence = selection_state = wf_state = None
+    terrain_state = None
     run_all = only is None
+    if run_all or only == 'S2B':
+        print('\n[S2B] MARKET TERRAIN MAP')
+        terrain_state = s2b_terrain(df, w, out, input_sha, attest)
     discover = (book_file is None)
     if not discover and run_all:
         print('\n[S3–S6] DISCOVERY / REGEN — SKIPPED on the frozen-book verification path.')
@@ -1495,7 +1796,8 @@ def main():
         print('  Run `python master.py` (no --book) or `--stage S3` for the full 1–2 day discovery.')
     if (run_all and discover) or only == 'S3':
         print('\n[S3] FAMILY DISCOVERY (long-pole; delegates to ratified orchestrator)')
-        s3_discovery(out, args.workers, input_sha, 'full', df=df, ad=ad, st=st, w=w)
+        s3_discovery(out, args.workers, input_sha, 'full', df=df, ad=ad, st=st, w=w,
+                     limit=args.s3_limit)
     if run_all or only == 'S3B':
         print('\n[S3B] PER-FAMILY EVIDENCE REVIEW + D2D GATE MEASUREMENT')
         evidence = s3b_family_evidence(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest)
@@ -1528,7 +1830,7 @@ def main():
         profile = s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, input_sha, attest)
     if run_all or only == 'S9':
         print('\n[S9] REPORT & SPLIT')
-        s9_report(out, attest, contenders, committed, sacred, args.market_label, args.chunk_mb, input_sha, profile, evidence, selection_state)
+        s9_report(out, attest, contenders, committed, sacred, args.market_label, input_sha, profile, evidence, selection_state)
 
     print('\n' + '═' * 68)
     print(f'MASTER COMPLETE in {_hms(time.time() - t0)} | out: {out}')

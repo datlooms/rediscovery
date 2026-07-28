@@ -3,6 +3,7 @@ import os
 import time
 import hashlib
 import json
+import pickle
 import threading
 import numpy as np
 import pandas as pd
@@ -10,6 +11,8 @@ import dots_thresholds as dt
 import portfolio_simulation_engine as engine
 import wf
 
+import triple_convergence_and_d2ddir as f0m
+import f0_to_schema as f0s
 import sequential_temporal as f1
 import state_transition as f2
 import conditional_interaction as f3
@@ -42,7 +45,8 @@ import rolling_leadlag as f11
 #  cut is baked in. Collect ALL candidates (survivors AND rejects).
 # ═══════════════════════════════════════════════════════════════
 
-RESULTS_DIR = "discovery_results"
+RESULTS_DIR = os.environ.get('DOT_RESULTS_DIR', "discovery_results")
+_LEGACY_RESULTS_DIR = "discovery_results"
 SCHEMA = ['family', 'script', 'signal_def', 'direction', 'd2d_mode', 'trades', 'WR',
           'agg_pf', 'worst_day_usd', 'hard_stop_days', 'folds_plus', 'min_fold_pf',
           'spread_pf', 'survival']
@@ -74,6 +78,24 @@ def _common(family, script, signal_def, direction, d2d_mode, row):
 # ── per-family scope builders: return kwargs for run_search ──────────────
 def _scope(kind):
     proof = kind == 'proof'
+
+    def f0_kw(df, adaptive, structural, warmup):
+        feat_candidates, equality_candidates = f0m.build_candidates(df)
+        eligible = (df['ADX_Value'].values >= 15) & (df['Volume'].values > 50)
+        vol_zero = df['Volume'].values == 0
+        warm = np.arange(len(df)) < warmup
+        fri_block = ((df['EST_DayOfWeek'].values == 5)
+                     & ((df['EST_Hour'].values > 16)
+                        | ((df['EST_Hour'].values == 16) & (df['EST_Minute'].values >= 45))))
+        entry_allowed = eligible & ~vol_zero & ~fri_block & ~warm
+        feature_conditions = f0m.build_conditions(df, feat_candidates, equality_candidates,
+                                                  adaptive, structural, eligible)
+        arrays = (df['High'].values, df['Low'].values, df['Close'].values, df['ATR_1M'].values,
+                  df['EST_DayOfWeek'].values, df['EST_Hour'].values, df['EST_Minute'].values)
+        return dict(feature_conditions=feature_conditions,
+                    all_features=feat_candidates + equality_candidates,
+                    entry_allowed=entry_allowed, d2d_dir=df['D2D_Trend_Dir'].values, arrays=arrays)
+
 
     def f1_kw(df, adaptive, structural, warmup):
         pool = f1.build_condition_pool(df, adaptive, structural, warmup)
@@ -152,7 +174,7 @@ def _scope(kind):
         return dict(pairs=f11.PAIRS, windows=windows, relations=f11.RELATIONS,
                     directions=['LONG', 'SHORT'])
 
-    return {'F1': f1_kw, 'F2': f2_kw, 'F3': f3_kw, 'F4': f4_kw, 'F5': f5_kw,
+    return {'F0': f0_kw, 'F1': f1_kw, 'F2': f2_kw, 'F3': f3_kw, 'F4': f4_kw, 'F5': f5_kw,
             'F6': f6_kw, 'F7': f7_kw, 'F8': f8_kw, 'F9': f9_kw, 'F11': f11_kw}
 
 
@@ -203,7 +225,238 @@ def _rows_F11(rows, s):
                     r['direction'], 'confirm', r) for r in rows]
 
 
+ALL_FAMILIES = [
+    ('F0', 'triple_convergence_and_d2ddir', 'pool'),
+    ('F1', 'sequential_temporal', 'pool'),
+    ('F2', 'state_transition', 'pool'),
+    ('F3', 'conditional_interaction', 'pool'),
+    ('F4', 'divergence_nonconfirm', 'pool'),
+    ('F5', 'persistence_autocorr', 'pool'),
+    ('F6', 'threshold_crossing', 'pool'),
+    ('F7', 'mean_reversion', 'pool'),
+    ('F8', 'cross_variable_structure', 'pool'),
+    ('F9', 'session_temporal', 'pool'),
+    ('F10', None, 'fused_into_F0'),
+    ('F11', 'rolling_leadlag', 'pool'),
+    ('F12', 'concurrence_profiler', 'diagnostic'),
+    ('F13', 'single_variable_extremes', 'diagnostic'),
+]
+DIAGNOSTIC_OUTPUTS = {'F12': 'concurrence_depth_bars.csv',
+                      'F13': 'results_F13_single_variable_extremes.csv'}
+
+
+def _provenance_path(csv_path):
+    return os.path.splitext(csv_path)[0] + '.provenance'
+
+
+def stamp_provenance(csv_path, input_sha):
+    payload = {'input_sha': input_sha, 'csv_sha256': _sha_file(csv_path)}
+    tmp = _provenance_path(csv_path) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _provenance_path(csv_path))
+
+
+def provenance_is_current(csv_path, input_sha):
+    pp = _provenance_path(csv_path)
+    if not (os.path.exists(csv_path) and os.path.exists(pp)):
+        return False, 'no provenance stamp'
+    try:
+        meta = json.load(open(pp, 'r', encoding='utf-8'))
+    except Exception:
+        return False, 'unreadable provenance'
+    if meta.get('input_sha') != input_sha:
+        return False, f"stamped for input_sha {str(meta.get('input_sha'))[:12]}, current is {str(input_sha)[:12]}"
+    if meta.get('csv_sha256') != _sha_file(csv_path):
+        return False, 'csv changed since stamping'
+    return True, 'current'
+
+
+FOLD_GAP_NOTE = (
+    'POOL PROPERTY THE SELECTION LAYER MUST KNOW — folds_plus and min_fold_pf on EVERY row of this '
+    'pool come from sacred wf.FOLDS, which is the CALENDAR LITERAL Jan..Jun. Any month outside that '
+    'window contributes NOTHING to any row fold evidence. On a series running past June (this run '
+    'ends {last}), the newest month is invisible to fold_plus, so S5 gate folds_plus >= 4 is decided '
+    'on Jan-Jun alone. This CANNOT be fixed without editing wf.py, which is sacred and byte-locked '
+    'at 793e6e5f8d9a; recording it at the point of use is the honest resolution. The proportional '
+    'six-slice fold plan used for the COMMITTED-SYSTEM headline (master.py fold_plan) is a separate '
+    'and data-relative mechanism and is NOT what produced these columns.')
+
+
+def write_pool_note(master_path, df):
+    last = str(df['Time'].values[-1])[:10] if df is not None and len(df) else 'unknown'
+    note = FOLD_GAP_NOTE.format(last=last)
+    path = os.path.splitext(master_path)[0] + '.POOL_NOTE.txt'
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(note + chr(10))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    print('  POOL NOTE -> ' + os.path.basename(path), flush=True)
+    print('    ' + note[:150] + '...', flush=True)
+    return path
+
+
+def verify_diagnostic_outputs(results_dir, input_sha, families=('F12', 'F13')):
+    gaps = []
+    rows = []
+    for fam in families:
+        name = DIAGNOSTIC_OUTPUTS.get(fam)
+        if not name:
+            continue
+        csv = os.path.join(results_dir, name)
+        ok, why = provenance_is_current(csv, input_sha)
+        rows.append((fam, name, 'OK' if ok else 'MISSING', why))
+        if not ok:
+            gaps.append(f'{fam} ({name}: {why})')
+    print(f"  DIAGNOSTIC OUTPUT VERIFICATION — after the stage ran, not before:", flush=True)
+    for fam, name, state, why in rows:
+        print(f"    {fam:4} {state:8} {name} — {why}", flush=True)
+    if gaps:
+        raise SystemExit(
+            "ABORT — a diagnostic family was scheduled but produced no current output: "
+            + '; '.join(gaps) +
+            ". SCHEDULING IS NOT COVERAGE. The pipeline was supposed to have just produced this, so "
+            "the same standard applies as to an ingested CSV: the file must exist and carry the "
+            "current input_sha. A multi-day scan must not complete reporting 14-family coverage with "
+            "a family empty.")
+    return rows
+
+
+def verify_family_coverage(queued_pool, queued_diag, input_sha, results_dir):
+    rows = []
+    gaps = []
+    for fam, script, role in ALL_FAMILIES:
+        if role == 'fused_into_F0':
+            rows.append((fam, 'FUSED', 'concurrence lens fused into F0; covered when F0 runs'))
+            if 'F0' not in queued_pool:
+                gaps.append(f'{fam} (fused into F0, but F0 is not covered)')
+            continue
+        if role == 'pool':
+            if fam in queued_pool:
+                rows.append((fam, 'QUEUED', 'chunked onto the S3 queue'))
+                continue
+            csv = os.path.join(results_dir, f'results_{fam}_{script}.csv')
+            ok, why = provenance_is_current(csv, input_sha)
+            if ok:
+                rows.append((fam, 'INGESTED', 'existing CSV, provenance current'))
+            else:
+                rows.append((fam, 'MISSING', why))
+                gaps.append(f'{fam} ({why})')
+            continue
+        if fam in queued_diag:
+            rows.append((fam, 'QUEUED', 'diagnostic stage scheduled this run'))
+            continue
+        csv = os.path.join(results_dir, DIAGNOSTIC_OUTPUTS.get(fam, ''))
+        ok, why = provenance_is_current(csv, input_sha)
+        if ok:
+            rows.append((fam, 'INGESTED', 'existing diagnostic output, provenance current'))
+        else:
+            rows.append((fam, 'MISSING', why))
+            gaps.append(f'{fam} ({why})')
+    n_q = sum(1 for r in rows if r[1] == 'QUEUED')
+    n_i = sum(1 for r in rows if r[1] == 'INGESTED')
+    n_f = sum(1 for r in rows if r[1] == 'FUSED')
+    n_m = len(gaps)
+    print(f"  FAMILY COVERAGE — {len(ALL_FAMILIES)} families: {n_q} queued, {n_i} ingested, "
+          f"{n_f} fused, {n_m} MISSING", flush=True)
+    for fam, state, why in rows:
+        print(f"    {fam:4} {state:9} {why}", flush=True)
+    if gaps:
+        raise SystemExit("ABORT — S3 would complete without these families: " + '; '.join(gaps) +
+                         ". A run must never silently omit a family, and a stale ingested CSV is not "
+                         "coverage. Queue them or supply a CSV stamped for this input_sha.")
+    return rows
+
+
+def _rows_F0(rows, script):
+    return list(rows)
+
+
+def f0_combo_count(kw, lo, hi):
+    import itertools as _it
+    feats = kw['all_features']
+    fc = kw['feature_conditions']
+    total = 0
+    for (i, j, k) in list(_it.combinations(range(len(feats)), 3))[lo:hi]:
+        total += (len(fc[feats[i]]) * len(fc[feats[j]]) * len(fc[feats[k]]) * 2)
+    return total
+
+
+F0_MIN_TRADES_OVERRIDE = 30
+F0_MIN_PF_OVERRIDE = 2.0
+F0_ASYMMETRY_NOTE = (
+    'F0 POOL PROPERTY — RECORDED, NOT HIDDEN. F0 candidates pass an APPROXIMATE PF pre-screen that '
+    'F2-F11 candidates never face. F0 first scores every triple with its own fast single-pass scorer '
+    '(same SPREAD 3.0, same BE trigger, same BE/LF/SL/FC exit types, walking real bars to real exits, '
+    'but strictly one-position-at-a-time with NO jar, NO conviction sizing and NO gap fillers), so the '
+    'TRADE COUNT IS EXACT while the PF is a flat-1-lot no-jar proxy. Only triples clearing that proxy '
+    f'PF >= {F0_MIN_PF_OVERRIDE} and trades >= {F0_MIN_TRADES_OVERRIDE} are re-scored through the '
+    'ratified engine. The PF gate is deliberately LOOSE (the scanner default is 4.0; it is overridden '
+    'DOWN to 2.0) because pre-gating hard on an approximated metric would discard candidates the '
+    'ratified engine might rate well. Consequence for selection: a triple the proxy rates below 2.0 '
+    'never reaches the pool even if the ratified engine would have rated it higher.')
+
+
+def run_f0_chunk(df, adaptive, structural, warmup, kw, lo, hi):
+    import itertools as _it
+    f0m.MIN_PF = F0_MIN_PF_OVERRIDE
+    f0m.MIN_TRADES = F0_MIN_TRADES_OVERRIDE
+    orig_comb = f0m.combinations
+
+    def _sliced(iterable, r):
+        return list(_it.combinations(iterable, r))[lo:hi]
+
+    f0m.combinations = _sliced
+    try:
+        survivors = f0m.run_search(df, kw['feature_conditions'], kw['all_features'],
+                                   kw['entry_allowed'], kw['d2d_dir'], kw['arrays'])
+    finally:
+        f0m.combinations = orig_comb
+    return list(survivors), f0_combo_count(kw, lo, hi)
+
+
+def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors):
+    kept = f0m.deduplicate(list(raw_survivors))
+    month = pd.Series(df['Time'].values).str[:7].values
+    return [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept]
+
+
+def _f0_chunk_pickle(script, idx):
+    return os.path.join(RESULTS_DIR, f"results_F0_{script}_c{idx:04d}.pkl")
+
+
+def collate_f0(script, n_chunks, df, adaptive, structural, warmup, expected_total, input_sha):
+    ok, detail = candidate_invariant('F0', script, n_chunks, expected_total)
+    if not ok and detail != 'missing per-chunk candidate count':
+        raise SystemExit(f"ABORT [F0] CANDIDATE-COUNT INVARIANT FAILED: {detail}. Chunking changed "
+                         f"the combo space; results are NOT trustworthy.")
+    raw = []
+    for idx in range(n_chunks):
+        pk = _f0_chunk_pickle(script, idx)
+        if not (os.path.exists(pk) and chunk_is_complete('F0', script, idx)):
+            return False, 0
+        with open(pk, 'rb') as f:
+            raw.extend(pickle.load(f))
+    n_raw = len(raw)
+    rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw)
+    csv, done = _family_paths('F0', script)
+    _write_atomic_csv(pd.DataFrame(rows, columns=SCHEMA), csv)
+    _mark_family_done(csv, done, len(rows))
+    if input_sha is not None:
+        stamp_provenance(csv, input_sha)
+    with open(os.path.splitext(csv)[0] + '.note', 'w', encoding='utf-8') as f:
+        f.write(F0_ASYMMETRY_NOTE + '\n')
+    print(f"  [F0] {n_raw} raw survivors across {n_chunks} chunks -> global 80% overlap dedup at "
+          f"COLLATION (single pass, ascending chunk order) -> {len(rows)} pool rows", flush=True)
+    return True, len(rows)
+
+
 FAMILIES = [
+    ('F0', 'triple_convergence_and_d2ddir', f0m, _rows_F0),
     ('F1', 'sequential_temporal', f1, _rows_F1),
     ('F2', 'state_transition', f2, _rows_F2),
     ('F3', 'conditional_interaction', f3, _rows_F3),
@@ -276,15 +529,82 @@ def resume_family(fam, script):
     return frame[SCHEMA].to_dict('records')
 
 
-def run_family(fam, script, mod, fmt, kw_builder, df, adaptive, structural, warmup):
-    orig = df['D2D_Trend_Dir'].values.copy()
-    kw = kw_builder(df, adaptive, structural, warmup)
+FRAME_MUTATORS = {
+    'F1': '__F1SEQ', 'F2': '__F2TRANS', 'F3': '__F3COND', 'F4': '__F4DIV', 'F5': '__F5PERS',
+    'F6': '__F6CROSS', 'F7': '__F7REV', 'F8': '__F8REL', 'F9': '__F9SESS', 'F11': '__F11LL',
+    'F12': '__F12DEPTH',
+}
+GATE_MUTATORS = ('F4', 'F7', 'F12', 'F13')
+
+
+class FrameGuard:
+    """Restores the shared frame to the exact state a family received it in.
+
+    Eleven of the twelve pool/diagnostic families inject their own scratch column
+    (__F1SEQ, __F3COND, ...) into the SHARED frame, and four also overwrite
+    D2D_Trend_Dir. F0 is the only family that validates its input vocabulary, so
+    it is the one that detects the contamination: its EXCLUDE-complement
+    assertion correctly rejects any extra column. Restoring the gate column alone
+    was never enough; the column SET is the same class of hazard on a different
+    object. Both are restored here, on every path that can execute a family.
+    """
+
+    def __init__(self, df):
+        self.df = df
+        self.cols = list(df.columns)
+        self.gate = df['D2D_Trend_Dir'].values.copy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        known = set(self.cols)
+        extra = [c for c in self.df.columns if c not in known]
+        if extra:
+            self.df.drop(columns=extra, inplace=True)
+        self.df['D2D_Trend_Dir'] = self.gate
+        return False
+
+
+def assert_frame_clean(df, baseline_cols, fam):
+    extra = [c for c in df.columns if c not in set(baseline_cols)]
+    if extra:
+        raise SystemExit(
+            f"ABORT [{fam}] the shared frame carries scratch columns from another family: {extra}. "
+            f"F0 validates its vocabulary and will reject these. FrameGuard should have removed them; "
+            f"a family injected a column outside a guarded region.")
+    return True
+
+
+def run_family(fam, script, mod, fmt, kw_builder, df, adaptive, structural, warmup, limit=0):
+    baseline_cols = list(df.columns)
+    assert_frame_clean(df, baseline_cols, fam)
     t0 = time.time()
-    try:
-        rows = mod.run_search(df, adaptive=adaptive, structural=structural, warmup=warmup, **kw)
-    finally:
-        df['D2D_Trend_Dir'] = orig
-    common = fmt(rows, script)
+    with FrameGuard(df):
+        kw = kw_builder(df, adaptive, structural, warmup)
+        bounds, n_units = _bounds_for(fam, kw)
+        if limit:
+            n_units = min(limit, n_units)
+        expected = None
+        if fam == 'F0':
+            expected = f0_combo_count(kw, 0, n_units)
+            raw, _exp = run_f0_chunk(df, adaptive, structural, warmup, kw, 0, n_units)
+            common = f0_rows_from_raw(df, adaptive, structural, warmup, raw)
+            actual = _exp
+        else:
+            sub = _slice_axis(kw, CHUNK_AXIS[fam], 0, n_units) if limit else dict(kw)
+            if fam == 'F1':
+                expected = n_units * len(kw['cond_labels']) * len(kw['directions'])
+            rows = mod.run_search(df, adaptive=adaptive, structural=structural, warmup=warmup, **sub)
+            common = fmt(rows, script)
+            actual = expected
+        if expected is not None and actual != expected:
+            raise SystemExit(
+                f"ABORT [{fam}] SEQUENTIAL-PATH CANDIDATE-COUNT INVARIANT FAILED: {actual} != "
+                f"{expected}. The bound applied to this path did not search what it promised.")
+        print(f"    [{fam}] sequential path bounded to {n_units} axis units"
+              + (f" | candidate invariant {actual} == {expected}" if expected is not None
+                 else " | no candidate expectation for this family"), flush=True)
     csv, done = _family_paths(fam, script)
     _write_atomic_csv(pd.DataFrame(common, columns=SCHEMA), csv)
     _mark_family_done(csv, done, len(common))
@@ -292,15 +612,20 @@ def run_family(fam, script, mod, fmt, kw_builder, df, adaptive, structural, warm
     return common
 
 
-CHUNK_AXIS = {'F1': ('cond_labels', 'lags'), 'F2': 'cond_labels', 'F3': 'base_pool',
+CHUNK_AXIS = {'F0': '__combos__', 'F1': ('cond_labels', 'lags'), 'F2': 'cond_labels', 'F3': 'base_pool',
               'F4': 'price_feats', 'F5': 'cond_labels', 'F6': 'cross_feats',
               'F7': 'stretch_feats', 'F8': 'pairs', 'F9': 'base_labels', 'F11': 'pairs'}
-COST_ORDER = ['F1', 'F3', 'F9', 'F11', 'F4', 'F2', 'F7', 'F5', 'F8', 'F6']
+COST_ORDER = ['F1', 'F0', 'F3', 'F9', 'F11', 'F4', 'F2', 'F7', 'F5', 'F8', 'F6']
 TARGET_CHUNKS_PER_FAMILY = 64
+TARGET_CHUNKS_F0 = 512
 _WCACHE = {}
 
 
 def _axis_units(kw, axis):
+    if axis == '__combos__':
+        import itertools as _it
+        n = len(kw['all_features'])
+        return sum(1 for _ in _it.combinations(range(n), 3)), [n]
     if isinstance(axis, tuple):
         sizes = [len(kw[a]) for a in axis]
         n = 1
@@ -320,6 +645,8 @@ def _one_axis(kw, name, lo, hi):
 
 def _slice_axis(kw, axis, lo, hi):
     out = dict(kw)
+    if axis == '__combos__':
+        return out
     if not isinstance(axis, tuple):
         out[axis] = _one_axis(kw, axis, lo, hi)
         return out
@@ -344,6 +671,8 @@ def _chunk_bounds(n_items, target=TARGET_CHUNKS_PER_FAMILY, unit_cap=None):
 def _bounds_for(fam, kw):
     axis = CHUNK_AXIS[fam]
     n_units, sizes = _axis_units(kw, axis)
+    if axis == '__combos__':
+        return _chunk_bounds(n_units, target=TARGET_CHUNKS_F0), n_units
     if isinstance(axis, tuple):
         return _chunk_bounds(n_units, target=n_units, unit_cap=sizes[1]), n_units
     return _chunk_bounds(n_units), n_units
@@ -389,6 +718,8 @@ def run_chunk_rows(fam, script, df, adaptive, structural, warmup, kw, lo, hi):
     sub = _slice_axis(kw, CHUNK_AXIS[fam], lo, hi)
     orig = df['D2D_Trend_Dir'].values.copy()
     try:
+        if fam == 'F0':
+            return run_f0_chunk(df, adaptive, structural, warmup, kw, lo, hi)
         if fam == 'F1':
             import run_f1_parallel as f1p
             month = pd.Series(df['Time'].values).str[:7].values
@@ -414,7 +745,18 @@ def _chunk_worker(payload):
         return (fam, idx, -1, 0.0, hi - lo)
     df, adaptive, structural, warmup, kw = orch._worker_context(scope, frame_path, fam)
     t0 = time.time()
-    common, expected = orch.run_chunk_rows(fam, script, df, adaptive, structural, warmup, kw, lo, hi)
+    with orch.FrameGuard(df):
+        common, expected = orch.run_chunk_rows(fam, script, df, adaptive, structural, warmup,
+                                               kw, lo, hi)
+    if fam == 'F0':
+        pk = orch._f0_chunk_pickle(script, idx)
+        tmpp = pk + '.tmp'
+        with open(tmpp, 'wb') as fh:
+            pickle.dump(common, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmpp, pk)
+        common = []
     if expected is not None:
         cpath = os.path.join(results_dir, f"results_{fam}_{script}_c{idx:04d}.cand")
         tmpc = cpath + '.tmp'
@@ -526,63 +868,131 @@ def sort_master(master_df):
         ascending=[False, False, True, False, False]).reset_index(drop=True)
 
 
+PARITY_LIMIT_DEFAULT = 200
+
+
+def _parity_chunk_worker(payload):
+    fam, script, scope, frame_path, lo, hi = payload
+    import discovery_orchestrator as orch
+    df, adaptive, structural, warmup, kw = orch._worker_context(scope, frame_path, fam)
+    rows, exp = orch.run_chunk_rows(fam, script, df, adaptive, structural, warmup, kw, lo, hi)
+    return rows, exp
+
+
 def parity_check(scope='proof', workers=1, df=None, adaptive=None, structural=None, warmup=None,
-                 families=None):
+                 families=None, limit=PARITY_LIMIT_DEFAULT, frame_path=None):
     if df is None:
-        df = engine.load_sealed_baseline(verbose=False) if hasattr(engine, 'load_sealed_baseline') else None
-    if warmup is None:
-        warmup = engine.warmup_floor(df, verbose=False)
-    if adaptive is None:
-        adaptive = dt.compute_adaptive_thresholds(df)
-    if structural is None:
-        structural = dt.compute_structural_gates(df)
+        raise SystemExit(
+            "ABORT — parity_check requires the INGESTED frame. It must never fall back to "
+            "engine.load_sealed_baseline(), which hardcodes equiDOT_recon171_step7_* and would "
+            "silently test a DIFFERENT dataset from the one S0 validated. Pass df/adaptive/"
+            "structural/warmup explicitly (master.py --parity does this).")
+    if adaptive is None or structural is None or warmup is None:
+        raise SystemExit("ABORT — parity_check requires adaptive, structural and warmup from S1/S2; "
+                         "recomputing them here could diverge from the run under test.")
     builders = _scope(scope)
     names = families or [f[0] for f in FAMILIES]
-    print(f"PARITY HARNESS — chunked vs unchunked, scope={scope}, {len(names)} families", flush=True)
+    print(f"PARITY HARNESS — chunked+collated vs unchunked, scope={scope}, "
+          f"limit={limit} axis units per family, workers={workers}", flush=True)
+    print(f"  the SERIAL REFERENCE leg is one process BY DEFINITION — parallelising it would use the "
+          f"very chunk mechanism under test. Only the chunked leg honours --workers.", flush=True)
+    print(f"  both legs are bounded by the SAME limit value, so they always see an identical range.",
+          flush=True)
     all_pass = True
     for fam, script, mod, fmt in FAMILIES:
         if fam not in names:
             continue
         kw = builders[fam](df, adaptive, structural, warmup)
-        bounds, n_units = _bounds_for(fam, kw)
+        bounds_full, n_full = _bounds_for(fam, kw)
+        n_units = min(limit, n_full) if limit else n_full
+        bounds = [(lo, hi) for (lo, hi) in bounds_full if lo < n_units]
+        bounds = [(lo, min(hi, n_units)) for (lo, hi) in bounds]
+        est = _parity_estimate(fam, n_units, n_full)
+        print(f"  {fam}: {n_units} of {n_full} axis units | {len(bounds)} chunks | {est}", flush=True)
+        t0 = time.time()
         orig_s = df['D2D_Trend_Dir'].values.copy()
         try:
-            serial = fmt(mod.run_search(df, adaptive=adaptive, structural=structural,
-                                        warmup=warmup, **kw), script)
+            if fam == 'F0':
+                serial_raw, exp_one = run_f0_chunk(df, adaptive, structural, warmup, kw, 0, n_units)
+                serial = f0_rows_from_raw(df, adaptive, structural, warmup, serial_raw)
+            else:
+                sub = _slice_axis(kw, CHUNK_AXIS[fam], 0, n_units) if n_units < n_full else dict(kw)
+                serial = fmt(mod.run_search(df, adaptive=adaptive, structural=structural,
+                                            warmup=warmup, **sub), script)
+                exp_one = None
+                if fam == 'F1':
+                    exp_one = (len(sub['cond_labels']) * len(kw['cond_labels'])
+                               * len(sub['lags']) * len(kw['directions']))
         finally:
             df['D2D_Trend_Dir'] = orig_s
-        exp_one = None
-        if fam == 'F1':
-            exp_one = len(kw['cond_labels']) ** 2 * len(kw['lags']) * len(kw['directions'])
+        t_serial = time.time() - t0
+        t0 = time.time()
         parts = []
         cand = 0
-        for lo, hi in bounds:
-            rows, exp = run_chunk_rows(fam, script, df, adaptive, structural, warmup, kw, lo, hi)
-            parts.extend(rows)
-            if exp is not None:
-                cand += exp
-        a = pd.DataFrame(serial, columns=SCHEMA)
-        b = pd.DataFrame(parts, columns=SCHEMA)
-        key = list(SCHEMA)
-        a = a.sort_values(key).reset_index(drop=True)
-        b = b.sort_values(key).reset_index(drop=True)
+        payloads = [(fam, script, scope, frame_path, lo, hi) for (lo, hi) in bounds]
+        if workers > 1 and frame_path is not None:
+            from concurrent.futures import ProcessPoolExecutor
+            import multiprocessing as _mp2
+            with ProcessPoolExecutor(max_workers=min(workers, len(payloads)),
+                                     mp_context=_mp2.get_context('spawn')) as ex:
+                for rows, exp in ex.map(_parity_chunk_worker, payloads):
+                    parts.extend(rows)
+                    if exp is not None:
+                        cand += exp
+        else:
+            if workers > 1:
+                print(f"    chunked leg run in-process: no frame_path supplied for worker "
+                      f"processes (result is identical, only slower)", flush=True)
+            for lo, hi in bounds:
+                rows, exp = run_chunk_rows(fam, script, df, adaptive, structural, warmup, kw, lo, hi)
+                parts.extend(rows)
+                if exp is not None:
+                    cand += exp
+        dedup_line = ''
+        if fam == 'F0':
+            chunked = f0_rows_from_raw(df, adaptive, structural, warmup, parts)
+            a_d = pd.DataFrame(serial, columns=SCHEMA).sort_values(list(SCHEMA)).reset_index(drop=True)
+            b_d = pd.DataFrame(chunked, columns=SCHEMA).sort_values(list(SCHEMA)).reset_index(drop=True)
+            dedup_ok = a_d.equals(b_d)
+            dedup_line = (f"    F0 COLLATION DEDUP VERIFIED: {'YES' if dedup_ok else 'NO'} — "
+                          f"{len(parts)} raw survivors from chunks -> global 80% overlap dedup at "
+                          f"collation -> {len(b_d)} rows; unchunked run deduped -> {len(a_d)} rows; "
+                          f"byte-identical: {dedup_ok}")
+            parts = chunked
+        t_chunk = time.time() - t0
+        a = pd.DataFrame(serial, columns=SCHEMA).sort_values(list(SCHEMA)).reset_index(drop=True)
+        b = pd.DataFrame(parts, columns=SCHEMA).sort_values(list(SCHEMA)).reset_index(drop=True)
         same = a.equals(b)
         cand_txt = ''
         if exp_one is not None:
             cand_ok = cand == exp_one
             same = same and cand_ok
-            cand_txt = f" | candidates {cand} vs {exp_one} {'OK' if cand_ok else 'MISMATCH'}"
-        print(f"  {fam:4} {len(bounds):5} chunks | serial {len(a):5} rows | chunked {len(b):5} rows "
-              f"| {'PASS' if same else 'FAIL'}{cand_txt}", flush=True)
+            cand_txt = f" | candidates serial {exp_one} vs chunked {cand} {'OK' if cand_ok else 'MISMATCH'}"
+        print(f"    {len(bounds):5} chunks | serial {len(a):5} rows ({t_serial:.1f}s) | "
+              f"chunked {len(b):5} rows ({t_chunk:.1f}s) | {'PASS' if same else 'FAIL'}{cand_txt}",
+              flush=True)
+        if dedup_line:
+            print(dedup_line, flush=True)
         all_pass = all_pass and same
         del kw
-    print(f"PARITY {'PASS' if all_pass else 'FAIL'} — chunking changes nothing a scanner computes"
-          if all_pass else "PARITY FAIL — chunking altered results; do NOT run a long scan", flush=True)
+    print(f"PARITY {'PASS' if all_pass else 'FAIL'}" +
+          (" — chunking plus collation changes nothing a scanner computes" if all_pass
+           else " — chunking altered results; do NOT run a long scan"), flush=True)
     return all_pass
 
 
+def _parity_estimate(fam, n_units, n_full):
+    per = {'F0': 0.40, 'F1': 0.35}.get(fam)
+    if per is None:
+        return "estimated runtime: seconds to a few minutes per leg"
+    secs = per * n_units
+    return (f"estimated runtime ~{secs:.0f}s per leg ({2 * secs:.0f}s both legs) "
+            f"at ~{per}s per axis unit")
+
+
 def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=None,
-                warmup=None, frame_path=None):
+                warmup=None, frame_path=None, input_sha=None, diagnostics=('F12', 'F13'),
+                limit=0):
     os.makedirs(RESULTS_DIR, exist_ok=True)
     print(f"equiDOT — discovery orchestrator | scope={scope} | workers={workers} | target lot 1.0", flush=True)
     if df is None:
@@ -602,6 +1012,8 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
         structural = dt.compute_structural_gates(df)
     builders = _scope(scope)
     f1_csv_present = os.path.exists(os.path.join(RESULTS_DIR, F1_CSV))
+    pool_queued = [f[0] for f in FAMILIES if not (f[0] == 'F1' and f1_csv_present)]
+    verify_family_coverage(pool_queued, list(diagnostics), input_sha, RESULTS_DIR)
     schedule = [(fam, script, mod, fmt) for fam, script, mod, fmt in FAMILIES
                 if not (fam == 'F1' and f1_csv_present)]
     total = len(schedule)
@@ -635,9 +1047,13 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
         for fam, script, _mod, _fmt in pending:
             kw = builders[fam](df, adaptive, structural, warmup)
             bounds, n_axis = _bounds_for(fam, kw)
+            if limit:
+                n_axis = min(limit, n_axis)
+                bounds = [(lo, min(hi, n_axis)) for (lo, hi) in bounds if lo < n_axis]
             if fam == 'F1':
-                expected_cands[fam] = (len(kw['cond_labels']) ** 2 * len(kw['lags'])
-                                       * len(kw['directions']))
+                expected_cands[fam] = (n_axis * len(kw['cond_labels']) * len(kw['directions']))
+            if fam == 'F0':
+                expected_cands[fam] = f0_combo_count(kw, 0, n_axis)
             plan.append((fam, script, n_axis, bounds))
             del kw
         order = {f: i for i, f in enumerate(COST_ORDER)}
@@ -722,12 +1138,56 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
                   flush=True)
             print("  sequentially in this process. If this recurs, lower --workers.", flush=True)
             print("", flush=True)
+        print('  PER-FAMILY CHUNK COMPLETENESS (before collation is attempted):', flush=True)
+        incomplete = {}
         for fam, script, _n, bounds in plan:
-            ok, n_rows = collate_family_chunks(fam, script, len(bounds), expected_cands.get(fam))
+            missing = [i for i in range(len(bounds)) if not chunk_is_complete(fam, script, i)]
+            state = 'complete' if not missing else f'MISSING {missing[:20]}'
+            if missing and len(missing) > 20:
+                state += f' ... and {len(missing) - 20} more'
+            print(f'    {fam:4} {len(bounds) - len(missing)}/{len(bounds)} {state}', flush=True)
+            if missing:
+                incomplete[fam] = missing
+        if incomplete:
+            print('  RE-QUEUEING ONLY THE MISSING CHUNKS — never a sequential re-search of a '
+                  'chunked family. One missing F1 chunk once triggered a full 1,713,630-candidate '
+                  'single-process re-search (~17 days at the measured rate); the resume path did '
+                  'the same work in 5m23s.', flush=True)
+            requeue = []
+            for fam, script, _n, bounds in plan:
+                for i in incomplete.get(fam, []):
+                    lo, hi = bounds[i]
+                    requeue.append((fam, script, scope, RESULTS_DIR, frame_path, i, lo, hi))
+            if requeue and frame_path is not None:
+                from concurrent.futures import ProcessPoolExecutor as _PPE
+                import multiprocessing as _mp3
+                nw2 = min(workers, len(requeue))
+                with _PPE(max_workers=nw2, mp_context=_mp3.get_context('spawn')) as ex2:
+                    for _r in ex2.map(_chunk_worker, requeue):
+                        pass
+            script_of = {p0: p1 for p0, p1, _a, _b in plan}
+            still = {}
+            for f, ix in incomplete.items():
+                left = [i for i in ix if not chunk_is_complete(f, script_of[f], i)]
+                if left:
+                    still[f] = left
+            if still:
+                raise SystemExit(
+                    f'ABORT — chunks still missing after re-queue: {still}. Named by index so the '
+                    f'operator does not have to derive them with a set-difference.')
+        for fam, script, _n, bounds in plan:
+            if fam == 'F0':
+                ok, n_rows = collate_f0(script, len(bounds), df, adaptive, structural, warmup,
+                                        expected_cands.get('F0'), input_sha)
+            else:
+                ok, n_rows = collate_family_chunks(fam, script, len(bounds),
+                                                   expected_cands.get(fam))
             if ok:
                 inv = candidate_invariant(fam, script, len(bounds), expected_cands.get(fam))[1]
                 print(f"  [{fam}] collated {len(bounds)} chunks -> {n_rows} rows "
                       f"| candidate invariant {inv}", flush=True)
+                if input_sha is not None:
+                    stamp_provenance(_family_paths(fam, script)[0], input_sha)
         ran_parallel = not died
         pending = [(fam, script, mod, fmt) for fam, script, mod, fmt in pending
                    if not family_is_complete(fam, script)[0]]
@@ -740,7 +1200,8 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
             print(f"  [family {i} of {len(pending)}] {fam} ({script}) starting{eta}", flush=True)
             t0 = time.time()
             with _Heartbeat(f"{fam} ({script})"):
-                run_family(fam, script, mod, fmt, builders[fam], df, adaptive, structural, warmup)
+                run_family(fam, script, mod, fmt, builders[fam], df, adaptive, structural,
+                           warmup, limit=limit)
             durations.append(time.time() - t0)
             print(f"  [family {i} of {len(pending)}] {fam} done in {_hms(durations[-1])}", flush=True)
     all_rows = []
@@ -757,13 +1218,33 @@ def orchestrate(scope='proof', workers=1, df=None, adaptive=None, structural=Non
         all_rows.extend(rows)
     if f1_csv_present:
         all_rows.extend(ingest_f1())
-    all_rows.extend(ingest_f0())
+    f0_collated = family_is_complete('F0', 'triple_convergence_and_d2ddir')[0]
+    if f0_collated:
+        print('  [F0] chunked path already collated F0 into the pool — SKIPPING ingest_f0(). '
+              'collate_f0 writes the same filename F0_CSV that ingest_f0 reads, so running both '
+              'double-counted F0 (19,757 -> 39,514) and inflated the trial count that spec H.1 '
+              'uses for the empirical null and Benjamini-Yekutieli, making the multiple-testing '
+              'bar harder than the search warranted.', flush=True)
+    else:
+        all_rows.extend(ingest_f0())
     master = pd.DataFrame(all_rows, columns=SCHEMA)
     master_path = os.path.join(RESULTS_DIR, "discovery_master.csv")
     _write_atomic_csv(sort_master(master), master_path)
+    write_pool_note(master_path, df)
     print(f"\nCollated {len(master)} candidates -> {master_path} "
           f"(sorted: folds_plus, min_fold_pf, worst_day_usd, agg_pf, WR; no rows dropped)", flush=True)
     by_fam = master.groupby('family').size().to_dict()
+    for fam, script, _mod, _fmt in FAMILIES:
+        ok, meta = family_is_complete(fam, script)
+        if not ok or meta is None:
+            continue
+        got = int(by_fam.get(fam, 0))
+        want = int(meta.get('rows', got))
+        if got != want:
+            raise SystemExit(
+                f'ABORT [{fam}] per-family pool count {got} != collated row count {want}. A family '
+                f'is being counted more than once (or lost) between collation and the pool; the '
+                f'trial count that feeds spec H.1 would be wrong.')
     print(f"Per-family counts: {by_fam}", flush=True)
 
 

@@ -663,6 +663,33 @@ def pass_criterion(book_rates, null_rates, null_evaluable=None):
     return base
 
 
+SPLIT_REQUIRED_KEYS = ('train_first_bar', 'train_last_bar', 'test_first_bar', 'test_last_bar')
+
+
+def assert_split_shape(splits):
+    """Item 17: fail LOUDLY if the split dict is not the shape derive_splits emits.
+
+    book_arm_from_valid once read train_lo_bar/test_lo_bar while derive_splits
+    emitted train_first_bar/test_first_bar. The mismatch was invisible because
+    the arm sits behind `if _pool_ok:` - with no pool it never runs, book_rates
+    stays nan, and the artifact reads UNEVALUABLE, WHICH IS INDISTINGUISHABLE
+    FROM CORRECT BEHAVIOUR. A silent nan is exactly the failure this stage has
+    already shipped twice, so the shape is asserted rather than assumed. NO
+    TRANSLATION LAYER: these are derive_splits' own key names, read directly, so
+    there is nothing to drift out of step.
+    """
+    if not splits:
+        raise SystemExit('ABORT [item 17] no splits were derived; the book arm cannot run and a '
+                         'nan rate would be indistinguishable from a correct UNEVALUABLE.')
+    missing = [k for k in SPLIT_REQUIRED_KEYS if k not in splits[0]]
+    if missing:
+        raise SystemExit(
+            f'ABORT [item 17] split dict is missing {missing}. book_arm_from_valid reads '
+            f'derive_splits\' own keys {list(SPLIT_REQUIRED_KEYS)}; got {sorted(splits[0])[:12]}. '
+            f'Failing loudly because a shape change here returns nan silently.')
+    return True
+
+
 def book_arm_from_valid(df, cands, pool, anchor, ad, st, warmup, splits, build_book_fn,
                         run_portfolio_fn, evaluate_valid_fn, conviction=None, gap_names=()):
     """Item 17: per split, apply VALID on the TRAINING SEGMENT ALONE, score on TEST.
@@ -672,10 +699,11 @@ def book_arm_from_valid(df, cands, pool, anchor, ad, st, warmup, splits, build_b
     test. Re-scoring a hand-assembled book per split is PROHIBITED and is the
     thing that already failed - a validated generator is not a validated book.
     """
+    assert_split_shape(splits)
     out = []
     for s_i, sp in enumerate(splits):
-        tr_lo, tr_hi = int(sp['train_lo_bar']), int(sp['train_hi_bar'])
-        te_lo, te_hi = int(sp['test_lo_bar']), int(sp['test_hi_bar'])
+        tr_lo, tr_hi = int(sp['train_first_bar']), int(sp['train_last_bar'])
+        te_lo, te_hi = int(sp['test_first_bar']), int(sp['test_last_bar'])
         train_rows, test_rows = [], []
         for _i, cr in cands.iterrows():
             fam = str(cr.get('family', ''))

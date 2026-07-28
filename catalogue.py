@@ -299,3 +299,127 @@ def dilution_curve(order_keys, entries_by_id, dirs_by_id, ranking_key_name, n_to
                      'same_bar_ge3_bars': tot, 'tolerance_N': n_tol, 'depth': depth,
                      'population': 'POOL', 'basis': 'distinct signals per bar, per direction'})
     return pd.DataFrame(rows)
+
+
+NULL_K_DEFAULT = 200
+NULL_K_MIN_MEANINGFUL = 50
+NULL_FIRE_TOL = 0.35
+NULL_MAX_ARITY = 3
+
+
+def _fire_count(mask):
+    return int(np.asarray(mask, dtype=bool).sum())
+
+
+def draw_matched_null_masks(pool, target_fire_counts, rng, k=NULL_K_DEFAULT,
+                            tol=NULL_FIRE_TOL, max_arity=NULL_MAX_ARITY, max_tries_per=60):
+    """APPENDIX A's matched null: same vocabulary, FIRE-RATE MATCHED.
+
+    Random conjunctions of 1..max_arity conditions drawn from the SAME
+    post-hygiene vocabulary the family's candidates come from, accepted only when
+    the conjunction's fire count lands within tol of a target sampled from THAT
+    FAMILY'S OWN fire-count distribution.
+
+    Fire-rate matching is not decoration. A triple fires far more rarely than any
+    single condition, so a null drawn without matching would be a null for a
+    different rarity than the population it prices - easier or harder, and in
+    either direction the exceedance it produces is not the exceedance Appendix A
+    asks for. Arity is allowed to vary precisely so the fire rate can be matched.
+    """
+    labels = sorted(pool.keys())
+    if not labels or len(target_fire_counts) == 0:
+        return []
+    targets = np.asarray(target_fire_counts, dtype=float)
+    out = []
+    for _i in range(k):
+        want = float(rng.choice(targets))
+        lo, hi = want * (1.0 - tol), want * (1.0 + tol)
+        best, best_gap = None, None
+        for _t in range(max_tries_per):
+            arity = int(rng.integers(1, max_arity + 1))
+            picks = [labels[int(rng.integers(0, len(labels)))] for _a in range(arity)]
+            m = np.asarray(pool[picks[0]], dtype=bool).copy()
+            for lb in picks[1:]:
+                m &= np.asarray(pool[lb], dtype=bool)
+            fc = _fire_count(m)
+            if fc == 0:
+                continue
+            if lo <= fc <= hi:
+                best = (m, picks, fc)
+                break
+            gap = abs(fc - want)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = (m, picks, fc), gap
+        if best is not None:
+            out.append({'mask': best[0], 'conditions': best[1], 'fire_count': best[2],
+                        'target_fire_count': int(want)})
+    return out
+
+
+def null_quality(n_null, k_requested):
+    """A null too small to price a tail must say so, not emit a confident number."""
+    if n_null < NULL_K_MIN_MEANINGFUL:
+        return ('null_too_small',
+                f'matched null holds {n_null} signals (< {NULL_K_MIN_MEANINGFUL}); the exceedance '
+                f'floor is 1/{max(n_null, 1)} and cannot resolve a tail')
+    return ('', '')
+
+
+def pricing_blank(reason):
+    """Item 8 fallback: the mandated names stay EMPTY rather than carry another quantity."""
+    return {'n_trials_family': '', 'null_valid_rate_family': '',
+            'expected_valid_by_chance_family': '', 'pf_null_p50_family': '',
+            'pf_null_p90_family': '', 'pf_null_p99_family': '',
+            'pf_null_exceedance_pct': '', 'EXPECTED_ROWS_AT_OR_ABOVE_THIS_PF': '',
+            'q_value_BY_family': '', 'pricing_unavailable_reason': reason}
+
+
+MECHANISM_D_LOCKS = {
+    'engine/dots_thresholds.py': '518862bf19fb',
+    'engine/terrain.py': 'dcaecaf7e8e1',
+    'engine/cluster_profiler.py': '070bb2aa7aaa',
+    'scanners/concurrence_profiler.py': '554019e93069',
+}
+
+
+def assert_episode_thresholds_mechanism_d(root, thr, mcol, ecol, k_tag, e_tag):
+    """Item 5's IN-RUN half. Appendix D: the lock is pre-run, this is in-run.
+
+    Two checks. First, the four modules that may legitimately define episodes,
+    clusters or strata are byte-verified against the shas Appendix D fixes as
+    constants of that document - the Developer verifies, he does not record his
+    own baseline. Second, the K and E arrays actually used to build this run's
+    episodes must be per-bar arrays from the oracle sweep, not scalars: a
+    constant broadcast over the span is exactly the local-percentile shape the
+    prohibition targets, and it is invisible to a file lock.
+    """
+    import hashlib
+    import os as _os
+    import numpy as _np
+    drift = []
+    for rel, want in MECHANISM_D_LOCKS.items():
+        p_ = _os.path.join(root, rel)
+        if not _os.path.exists(p_):
+            drift.append(f'{rel} MISSING')
+            continue
+        got = hashlib.sha256(open(p_, 'rb').read()).hexdigest()[:12]
+        if got != want:
+            drift.append(f'{rel} {got} != {want}')
+    if drift:
+        raise SystemExit(
+            'ABORT [item 5] market-object module drift: ' + '; '.join(drift) +
+            '. These four modules are the only ones that may define episodes, clusters or strata. '
+            'Any change requires explicit re-blessing regardless of how the cut is written.')
+    for col, tag, name in ((mcol, k_tag, 'K magnitude'), (ecol, e_tag, 'E efficiency')):
+        arr = thr.get((col, tag))
+        if arr is None:
+            raise SystemExit(f'ABORT [item 5] episode threshold {name} ({col}, {tag}) absent from '
+                             f'the oracle sweep - it did not route through dots_thresholds.')
+        a = _np.asarray(arr)
+        if a.ndim == 0 or a.size <= 1:
+            raise SystemExit(
+                f'ABORT [item 5] episode threshold {name} is a SCALAR. Episode thresholds must be '
+                f'per-bar arrays from mechanism D (rolling, day-refreshed, causal). A constant '
+                f'broadcast over the span is a span-wide cut and the file lock cannot see it.')
+    return {'modules_verified': len(MECHANISM_D_LOCKS), 'k_col': mcol, 'e_col': ecol,
+            'basis': 'mechanism D, rolling-2500, day-refreshed, per-bar arrays'}

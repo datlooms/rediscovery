@@ -836,7 +836,10 @@ def _no_constraint(_d, _ss):
     return True, ''
 
 
-def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
+NULL_SEED_BASE = 20260728
+
+
+def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=None):
     import catalogue as cat
     import cluster_profiler as cp
     import conviction as C
@@ -852,6 +855,7 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
         print('  CATALOGUE: no candidates.csv - S3/S4/S5 have not produced a pool. NOT marking done.')
         return None
     cands = pd.read_csv(cand)
+    null_k = int(null_k) if null_k else cat.NULL_K_DEFAULT
     n = len(df)
     bar_day = pd.Series(df['Time'].astype(str).values).str[:10].values
     U = cp.eligible_universe(df, w)
@@ -859,6 +863,10 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
     fwd, mag, eff, valid, thr, mcol, ecol = cp.thrust_thresholds(df, W, (K,), (E,))
     ev = cp.thrust_events(fwd, mag, eff, valid, thr[(mcol, f'k{int(K*100)}')],
                           thr[(ecol, f'e{int(E*100)}')], w)
+    mda = cat.assert_episode_thresholds_mechanism_d(_HERE, thr, mcol, ecol,
+                                                    f'k{int(K*100)}', f'e{int(E*100)}')
+    print(f'  ITEM 5 IN-RUN ASSERTION: {mda["modules_verified"]}/4 market-object modules '
+          f'byte-verified, episode K/E are per-bar arrays from {mda["basis"]}')
     cs = cp.build_cluster_set(n, ev, tr.CONTIGUOUS_TOLERANCE)
     reach = cat.reachable_episodes(cs, df, w, U)
     raw_tot = {d: int((cs['clusters']['dir'] == d).sum()) for d in (1, -1)}
@@ -870,6 +878,16 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
     gate_ok = np.flatnonzero((df['Hurst'].values >= hurst_hi) if hurst_hi is not None
                              else np.ones(n, dtype=bool)).astype(np.int64)
     conv = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
+    fam_fire_counts = {}
+    for fam, g in cands.groupby('family'):
+        fc = []
+        for _i, cr in g.iterrows():
+            try:
+                mk = score_g.family_mask(df, pool, fam, str(cr['signal_def']), ad, st)
+                fc.append(int(np.asarray(mk, dtype=bool).sum()))
+            except Exception:
+                continue
+        fam_fire_counts[fam] = fc
     per_family = {}
     entries_by_id, dirs_by_id, fams_by_id = {}, {}, {}
     for fam, g in cands.groupby('family'):
@@ -912,18 +930,48 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
         fr = pd.DataFrame(rows)
         if len(fr):
             N_F = len(fr)
-            v = fr[fr['verdict'] == 'VALID']
-            pfs = [x for x in v.get('agg_pf', pd.Series(dtype=float)).tolist()
-                   if isinstance(x, (int, float)) and math.isfinite(x)]
-            null_pfs = sorted(pfs)
-            null_rate = (len(v) / float(N_F)) if N_F else 0.0
-            price = [cat.pricing_columns(r.get('agg_pf', float('nan')), N_F, null_rate, null_pfs)
-                     for _j, r in fr.iterrows()]
-            for k in price[0]:
-                fr[k] = [p[k] for p in price]
-            exc = pd.to_numeric(fr['pf_null_exceedance_pct'], errors='coerce').fillna(1.0).values
-            fr['q_value_BY_family'] = np.round(cat.benjamini_yekutieli(exc), 6)
+            rng = np.random.default_rng(NULL_SEED_BASE + abs(hash(fam)) % 100000)
+            fire_targets = [c for c in fam_fire_counts.get(fam, []) if c > 0]
+            drawn = cat.draw_matched_null_masks(pool, fire_targets, rng, k=null_k)
+            null_frames = []
+            for j, nd in enumerate(drawn):
+                col = f'__NULL_{fam}_{j}'
+                df[col] = np.asarray(nd['mask'], dtype=bool).astype(int)
+                nsig = pd.DataFrame([{'feat_1': col, 'thresh_1': '==1', 'feat_2': col,
+                                      'thresh_2': '==1', 'feat_3': col, 'thresh_3': '==1',
+                                      'direction': 'LONG' if j % 2 == 0 else 'SHORT'}])
+                ntd = engine.run_portfolio(df, nsig, adaptive=ad, structural=st, warmup=w,
+                                           verbose=False, conviction=conv)
+                null_frames.append(ntd[~ntd['signal_name'].isin(cp.GAP_NAMES)])
+                df.drop(columns=[col], inplace=True)
+            null_rate, null_pfs = cat.matched_null_rate(null_frames, bar_day)
+            qflag, qwhy = cat.null_quality(len(null_frames), null_k)
+            print(f'    {fam:4} matched null: requested K={null_k}, drawn {len(drawn)}, '
+                  f'VALID-passing {len(null_pfs)}, rate {null_rate:.4f}'
+                  + (f' | {qflag}' if qflag else ''))
+            if qflag:
+                blanks = cat.pricing_blank(qwhy)
+                for kk, vv in blanks.items():
+                    fr[kk] = vv
+                fr['n_null_family'] = len(null_frames)
+                fr['null_seed'] = NULL_SEED_BASE
+            else:
+                price = [cat.pricing_columns(r.get('agg_pf', float('nan')), N_F, null_rate,
+                                             null_pfs) for _j, r in fr.iterrows()]
+                for kk in price[0]:
+                    fr[kk] = [pz[kk] for pz in price]
+                exc = pd.to_numeric(fr['pf_null_exceedance_pct'], errors='coerce').fillna(1.0).values
+                fr['q_value_BY_family'] = np.round(cat.benjamini_yekutieli(exc), 6)
+                fr['pricing_unavailable_reason'] = ''
+                fr['n_null_family'] = len(null_frames)
+                fr['null_seed'] = NULL_SEED_BASE
         per_family[fam] = fr
+    _priced = {f: (len(fr) > 0 and 'pricing_unavailable_reason' in fr.columns
+                   and str(fr['pricing_unavailable_reason'].iloc[0]) == '')
+               for f, fr in per_family.items()}
+    _why = {f: (str(fr['pricing_unavailable_reason'].iloc[0]) if len(fr)
+                and 'pricing_unavailable_reason' in fr.columns else 'no rows')
+            for f, fr in per_family.items()}
     cat_dir = os.path.join(out, 'catalogues')
     os.makedirs(cat_dir, exist_ok=True)
     print('  CATALOGUE ROW COUNT PER FAMILY:')
@@ -939,11 +987,23 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
             f'(UP {len(reach[1])} / DOWN {len(reach[-1])}, MARKET). REACHABLE IS PRIMARY.',
             'per-signal statistics are PROPERTY OF THE BOOK; terrain and reachable are PROPERTY OF '
             'THE MARKET.',
-            cat.CATALOGUE_HEADER_PRICING, cat.CATALOGUE_HEADER_UNSCORED,
+            (cat.CATALOGUE_HEADER_PRICING if _priced.get(fam) else
+             'PRICING COLUMNS ARE BLANK for this family: ' + str(_why.get(fam, '')) +
+             '. The Appendix A names carry no substitute quantity - reading this catalogue is still '
+             'a search of size N_F, and nothing in this file prices it.'),
+            cat.CATALOGUE_HEADER_UNSCORED,
             'UNEVALUABLE rows are RETAINED with statistics blank and a reason_code. INVALID rows '
             '(V2 survival breach) do not enter; their count is reported in the run log.'])
         vc = fr['verdict'].value_counts().to_dict() if len(fr) else {}
         print(f'    {fam:4} {len(fr):7} rows | {vc}')
+    has_f0 = 'F0' in per_family and len(per_family.get('F0', []))
+    n_valid_triples = {}
+    if has_f0:
+        f0v = per_family['F0']
+        for _i, rr in f0v[f0v['verdict'] == 'VALID'].iterrows():
+            for t in str(rr.get('touched_episode_ids', '')).split(';'):
+                if t:
+                    n_valid_triples[int(t)] = n_valid_triples.get(int(t), 0) + 1
     unclaimed = []
     spans = cat.episode_spans(cs)
     claimed = {d: set() for d in (1, -1)}
@@ -960,7 +1020,7 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest):
                               'est_hour_start': int(df['EST_Hour'].values[b0]),
                               'n_conditions_firing': int(sum(1 for k in pool
                                                              if pool[k][b0:b1 + 1].any())),
-                              'n_valid_triples_touching': 0,
+                              'n_valid_triples_touching': n_valid_triples.get(eid, '' if not has_f0 else 0),
                               'population': 'MARKET'})
     uf = pd.DataFrame(unclaimed)
     _write_with_header(os.path.join(cat_dir, 'unclaimed_reachable.csv'), uf, [

@@ -26,6 +26,16 @@ those families, and with it the shape of the PF distribution the null produces.
 This is a stated limitation of the null, not a departure from the specification,
 and it bears most on the lagged families.
 
+AND IT DOES NOT MATCH CONDITION COMPOSITION - INTENDED, NOT A GAP. At hard
+targets the surviving draws are ~72% arity-3 with no arity-1, use ~32% of the
+vocabulary against ~83% on an easy control, and over-represent equality
+conditions ~45% against ~28%. That skew is the fire-rate constraint doing its
+job: a rare fire rate CANNOT be reached with a common condition, and the
+family's own candidates sit under the identical constraint, so a null skewed
+rare and high-arity is MORE like the population it prices, not less. DO NOT
+MATCH COMPOSITION. Doing so would make the null a near-copy of the population
+and destroy the independence that gives the exceedance its meaning.
+
 REACHABLE IS THE PRIMARY DENOMINATOR. Raw terrain counts episodes the book
 could never have taken: the eligible mask and the D2D direction agreement are
 deliberate, measured exclusions, so an episode failing them is not a miss. Both
@@ -312,6 +322,25 @@ def dilution_curve(order_keys, entries_by_id, dirs_by_id, ranking_key_name, n_to
 
 
 NULL_K_DEFAULT = 200
+NULL_K_BY_FAMILY = {'F0': 500}
+NULL_K_ATTEMPT_MULTIPLIER = 60
+
+
+def null_k_for(family, default=None):
+    """F0 needs a larger K, and the remedy is NEVER a wider tolerance.
+
+    F0's candidates are triples - the rarest population in the build - so its
+    fire-rate targets are the hard ones. Measured, hard targets match at ~23.5%,
+    so K=200 yields ~47 in-band and straddles the floor of 50: three independent
+    runs returned 47, 59 and 47, which means a family sitting near the floor
+    prices or blanks ON SEED ALONE. Raising K leaves the matching intact and buys
+    in-band draws by sampling more; widening the tolerance would produce a null
+    matched to a DIFFERENT RARITY than the population it prices, which is the
+    defect this guard exists to prevent, re-entered through the one parameter
+    that looks like a dial. THE TOLERANCE MUST NOT BE TOUCHED. If K must rise far
+    enough that runtime bites, BLANK AND SAY SO.
+    """
+    return int(NULL_K_BY_FAMILY.get(family, default if default else NULL_K_DEFAULT))
 NULL_K_MIN_MEANINGFUL = 50
 NULL_FIRE_TOL = 0.35
 NULL_MAX_ARITY = 3

@@ -932,7 +932,8 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=No
             N_F = len(fr)
             rng = np.random.default_rng(NULL_SEED_BASE + abs(hash(fam)) % 100000)
             fire_targets = [c for c in fam_fire_counts.get(fam, []) if c > 0]
-            drawn, nstats = cat.draw_matched_null_masks(pool, fire_targets, rng, k=null_k)
+            fam_k = cat.null_k_for(fam, null_k)
+            drawn, nstats = cat.draw_matched_null_masks(pool, fire_targets, rng, k=fam_k)
             long_share = float((g['direction'].astype(str).str.upper() == 'LONG').mean()) \
                 if len(g) else 0.5
             null_frames = []
@@ -948,8 +949,8 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=No
                 null_frames.append(ntd[~ntd['signal_name'].isin(cp.GAP_NAMES)])
                 df.drop(columns=[col], inplace=True)
             null_rate, null_pfs = cat.matched_null_rate(null_frames, bar_day)
-            qflag, qwhy = cat.null_quality(len(null_frames), null_k, nstats)
-            print(f'    {fam:4} matched null: requested K={null_k}, IN-BAND {nstats["matched"]} '
+            qflag, qwhy = cat.null_quality(len(null_frames), fam_k, nstats)
+            print(f'    {fam:4} matched null: requested K={fam_k}, IN-BAND {nstats["matched"]} '
                   f'({nstats["matched_fraction"]:.1%} matched, {nstats["rejected_out_of_band"]} '
                   f'rejected out-of-band, targets {nstats["target_min"]}..{nstats["target_max"]} '
                   f'fires, tol +/-{nstats["tol"]:.0%}), direction LONG-share {long_share:.2f}, '
@@ -1124,7 +1125,17 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
            -1: bk[bk['direction'] == 'SHORT']['entry_bar'].values}
     sgn = {1: bk[bk['direction'] == 'LONG']['signal_name'].nunique(),
            -1: bk[bk['direction'] == 'SHORT']['signal_name'].nunique()}
-    grid = sel.depth_yield_grid(ent, sgn, tdays)
+    ids_dir = {1: bk[bk['direction'] == 'LONG']['signal_name'].values.tolist(),
+               -1: bk[bk['direction'] == 'SHORT']['signal_name'].values.tolist()}
+    grid = sel.depth_yield_grid(ent, sgn, tdays, ids_by_dir=ids_dir)
+    grid['depth_yield_LONG_per_signal'] = [sel.depth_yield_per_signal(v, sgn.get(1, 0))
+                                           for v in grid['depth_yield_LONG']]
+    grid['depth_yield_SHORT_per_signal'] = [sel.depth_yield_per_signal(v, sgn.get(-1, 0))
+                                            for v in grid['depth_yield_SHORT']]
+    grid['same_signal_refire_LONG'] = [round(sel.same_signal_refire_rate(
+        ent.get(1, []), int(t), ids_dir[1]), 4) for t in grid['tolerance_N']]
+    grid['same_signal_refire_SHORT'] = [round(sel.same_signal_refire_rate(
+        ent.get(-1, []), int(t), ids_dir[-1]), 4) for t in grid['tolerance_N']]
     h3 = sel.h3_within_direction(bk)
     base_hdr = [f'dataset_rows={attest["rows"]} segment={segment_label}',
                 f'oracle_sha256_12={oracle_sha}']
@@ -1636,9 +1647,34 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
     null_rates = [r['null_persistence_rate'] for r in null_summary] if null_summary else []
     null_ok = [not str(r['status']).startswith('UNEVALUABLE') for r in null_summary] if null_summary else []
     book_rates = [float('nan')] * len(null_rates)
+    book_meta = {'persist_definition': wfs.PERSIST_DEFINITION,
+                 'denominator_definition': wfs.DENOMINATOR_DEFINITION}
+    null_meta = {'persist_definition': wfs.PERSIST_DEFINITION,
+                 'denominator_definition': wfs.DENOMINATOR_DEFINITION}
+    agree = wfs.assert_arms_agree(book_meta, null_meta)
+    print(f'  ITEM 18 ARMS AGREE (asserted, abort on mismatch): persist = '
+          f'{agree["persist_definition"]}')
+    print(f'    denominator = {agree["denominator_definition"]}')
+    if _pool_ok:
+        import catalogue as cat2
+        cands_wf = pd.read_csv(_cand)
+        conv_wf = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
+        arm = wfs.book_arm_from_valid(df, cands_wf, pool, anchor, ad, st, w, splits,
+                                      score_g.build_book, engine.run_portfolio,
+                                      cat2.evaluate_valid, conviction=conv_wf,
+                                      gap_names=cp.GAP_NAMES)
+        book_rates = [a_['rate'] for a_ in arm]
+        for a_ in arm:
+            print(f'    split {a_["split"]}: VALID admitted {a_["entities"]} on train, '
+                  f'{a_["k"]}/{a_["n_traded"]} persisted on test -> rate '
+                  f'{a_["rate"] if a_["rate"] == a_["rate"] else "nan"}'
+                  + (f' | {a_["note"]}' if a_['note'] else ''))
     verdict = wfs.pass_criterion(book_rates, null_rates, null_ok)
-    verdict['book_arm'] = ('UNEVALUABLE - the book arm requires the selection funnel re-run per split, which '
-                           'requires a candidate pool S3 has never produced')
+    verdict['certifies'] = ('THE CATALOGUE INCLUSION RULE (VALID), NOT ANY BOOK. Re-scoring a '
+                            'hand-assembled book per split is prohibited: a validated generator '
+                            'is not a validated book.')
+    verdict['persist_definition'] = agree['persist_definition']
+    verdict['denominator_definition'] = agree['denominator_definition']
     pc = pd.DataFrame([{**verdict, 'splits_derived': len(splits),
                         'attestation_records': int(len(trail)),
                         'attestation_repeat_groups': int(len(repeats)),

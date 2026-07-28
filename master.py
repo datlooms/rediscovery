@@ -932,28 +932,37 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=No
             N_F = len(fr)
             rng = np.random.default_rng(NULL_SEED_BASE + abs(hash(fam)) % 100000)
             fire_targets = [c for c in fam_fire_counts.get(fam, []) if c > 0]
-            drawn = cat.draw_matched_null_masks(pool, fire_targets, rng, k=null_k)
+            drawn, nstats = cat.draw_matched_null_masks(pool, fire_targets, rng, k=null_k)
+            long_share = float((g['direction'].astype(str).str.upper() == 'LONG').mean()) \
+                if len(g) else 0.5
             null_frames = []
             for j, nd in enumerate(drawn):
                 col = f'__NULL_{fam}_{j}'
                 df[col] = np.asarray(nd['mask'], dtype=bool).astype(int)
                 nsig = pd.DataFrame([{'feat_1': col, 'thresh_1': '==1', 'feat_2': col,
                                       'thresh_2': '==1', 'feat_3': col, 'thresh_3': '==1',
-                                      'direction': 'LONG' if j % 2 == 0 else 'SHORT'}])
+                                      'direction': ('LONG' if rng.random() < long_share
+                                                    else 'SHORT')}])
                 ntd = engine.run_portfolio(df, nsig, adaptive=ad, structural=st, warmup=w,
                                            verbose=False, conviction=conv)
                 null_frames.append(ntd[~ntd['signal_name'].isin(cp.GAP_NAMES)])
                 df.drop(columns=[col], inplace=True)
             null_rate, null_pfs = cat.matched_null_rate(null_frames, bar_day)
-            qflag, qwhy = cat.null_quality(len(null_frames), null_k)
-            print(f'    {fam:4} matched null: requested K={null_k}, drawn {len(drawn)}, '
+            qflag, qwhy = cat.null_quality(len(null_frames), null_k, nstats)
+            print(f'    {fam:4} matched null: requested K={null_k}, IN-BAND {nstats["matched"]} '
+                  f'({nstats["matched_fraction"]:.1%} matched, {nstats["rejected_out_of_band"]} '
+                  f'rejected out-of-band, targets {nstats["target_min"]}..{nstats["target_max"]} '
+                  f'fires, tol +/-{nstats["tol"]:.0%}), direction LONG-share {long_share:.2f}, '
                   f'VALID-passing {len(null_pfs)}, rate {null_rate:.4f}'
-                  + (f' | {qflag}' if qflag else ''))
+                  + (f' | {qflag} -> Appendix A columns BLANK' if qflag else ''))
             if qflag:
                 blanks = cat.pricing_blank(qwhy)
                 for kk, vv in blanks.items():
                     fr[kk] = vv
                 fr['n_null_family'] = len(null_frames)
+                fr['null_matched_fraction'] = nstats['matched_fraction']
+                fr['null_rejected_out_of_band'] = nstats['rejected_out_of_band']
+                fr['null_direction_long_share'] = round(long_share, 4)
                 fr['null_seed'] = NULL_SEED_BASE
             else:
                 price = [cat.pricing_columns(r.get('agg_pf', float('nan')), N_F, null_rate,
@@ -964,6 +973,9 @@ def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=No
                 fr['q_value_BY_family'] = np.round(cat.benjamini_yekutieli(exc), 6)
                 fr['pricing_unavailable_reason'] = ''
                 fr['n_null_family'] = len(null_frames)
+                fr['null_matched_fraction'] = nstats['matched_fraction']
+                fr['null_rejected_out_of_band'] = nstats['rejected_out_of_band']
+                fr['null_direction_long_share'] = round(long_share, 4)
                 fr['null_seed'] = NULL_SEED_BASE
         per_family[fam] = fr
     _priced = {f: (len(fr) > 0 and 'pricing_unavailable_reason' in fr.columns

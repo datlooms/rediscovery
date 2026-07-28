@@ -16,6 +16,16 @@ EVERY TABLE STATES ITS PARAMETERS AT THE POINT OF USE AND CARRIES A MARKET OR
 BOOK LABEL. Terrain and reachable episodes are MARKET. Everything computed from
 a signal's own trades is BOOK.
 
+WHAT THE MATCHED NULL MATCHES, AND WHAT IT DOES NOT. Appendix A specifies three
+things - the same post-hygiene vocabulary, fire-rate matching, and the identical
+VALID predicate - and the null meets all three, plus the family's own direction
+composition. It matches RARITY. It does NOT match TEMPORAL STRUCTURE: a null
+conjunction fires same-bar, whereas F1's ordered pairs, F2's transitions and F6's
+crossings are lagged constructions. Firing autocorrelation therefore differs for
+those families, and with it the shape of the PF distribution the null produces.
+This is a stated limitation of the null, not a departure from the specification,
+and it bears most on the lagged families.
+
 REACHABLE IS THE PRIMARY DENOMINATOR. Raw terrain counts episodes the book
 could never have taken: the eligible mask and the D2D direction agreement are
 deliberate, measured exclusions, so an episode failing them is not a miss. Both
@@ -316,26 +326,48 @@ def draw_matched_null_masks(pool, target_fire_counts, rng, k=NULL_K_DEFAULT,
     """APPENDIX A's matched null: same vocabulary, FIRE-RATE MATCHED.
 
     Random conjunctions of 1..max_arity conditions drawn from the SAME
-    post-hygiene vocabulary the family's candidates come from, accepted only when
-    the conjunction's fire count lands within tol of a target sampled from THAT
-    FAMILY'S OWN fire-count distribution.
+    post-hygiene vocabulary the family's candidates come from, accepted ONLY
+    when the conjunction's fire count lands within tol of a target sampled from
+    THAT FAMILY'S OWN fire-count distribution.
+
+    THE BAND IS A FILTER, NOT A PREFERENCE. An out-of-band draw is DISCARDED,
+    never kept as a closest miss. Keeping misses made n_null a count of masks
+    rather than a count of MATCHED masks, so the K-floor in null_quality tested
+    the wrong quantity and a null of the wrong rarity was published under a
+    header asserting the search had been priced. Discarding is chosen over a
+    separate matched-fraction gate because it makes the existing K-floor do
+    double duty: after this change n_null IS the matched count, so one threshold
+    guards both quantities and there is no second number to keep in step.
 
     Fire-rate matching is not decoration. A triple fires far more rarely than any
     single condition, so a null drawn without matching would be a null for a
     different rarity than the population it prices - easier or harder, and in
     either direction the exceedance it produces is not the exceedance Appendix A
-    asks for. Arity is allowed to vary precisely so the fire rate can be matched.
+    asks for. Arity varies precisely so the fire rate can be matched, and F0 is
+    the most exposed family because its candidates are triples, the rarest
+    population in the build.
+
+    Returns (matched_masks, attempts_stats). attempts_stats carries the matched
+    fraction so the console line and the catalogue can both report how well the
+    null matched without re-deriving it.
     """
     labels = sorted(pool.keys())
+    stats = {'requested_k': int(k), 'draws_attempted': 0, 'matched': 0,
+             'rejected_out_of_band': 0, 'tol': tol,
+             'target_min': '', 'target_max': ''}
     if not labels or len(target_fire_counts) == 0:
-        return []
+        stats['matched_fraction'] = 0.0
+        return [], stats
     targets = np.asarray(target_fire_counts, dtype=float)
+    stats['target_min'] = int(targets.min())
+    stats['target_max'] = int(targets.max())
     out = []
     for _i in range(k):
         want = float(rng.choice(targets))
         lo, hi = want * (1.0 - tol), want * (1.0 + tol)
-        best, best_gap = None, None
+        hit = None
         for _t in range(max_tries_per):
+            stats['draws_attempted'] += 1
             arity = int(rng.integers(1, max_arity + 1))
             picks = [labels[int(rng.integers(0, len(labels)))] for _a in range(arity)]
             m = np.asarray(pool[picks[0]], dtype=bool).copy()
@@ -345,23 +377,37 @@ def draw_matched_null_masks(pool, target_fire_counts, rng, k=NULL_K_DEFAULT,
             if fc == 0:
                 continue
             if lo <= fc <= hi:
-                best = (m, picks, fc)
+                hit = {'mask': m, 'conditions': picks, 'fire_count': fc,
+                       'target_fire_count': int(want)}
                 break
-            gap = abs(fc - want)
-            if best_gap is None or gap < best_gap:
-                best, best_gap = (m, picks, fc), gap
-        if best is not None:
-            out.append({'mask': best[0], 'conditions': best[1], 'fire_count': best[2],
-                        'target_fire_count': int(want)})
-    return out
+            stats['rejected_out_of_band'] += 1
+        if hit is not None:
+            out.append(hit)
+            stats['matched'] += 1
+    stats['matched_fraction'] = round(stats['matched'] / float(k), 4) if k else 0.0
+    return out, stats
 
 
-def null_quality(n_null, k_requested):
-    """A null too small to price a tail must say so, not emit a confident number."""
-    if n_null < NULL_K_MIN_MEANINGFUL:
-        return ('null_too_small',
-                f'matched null holds {n_null} signals (< {NULL_K_MIN_MEANINGFUL}); the exceedance '
-                f'floor is 1/{max(n_null, 1)} and cannot resolve a tail')
+def null_quality(n_matched, k_requested, stats=None):
+    """n_matched is now a count of MATCHED draws, so the K-floor does double duty.
+
+    Before the band became a filter this tested a count of masks, and 141 of 200
+    unmatched draws could pass it. A null too small to price a tail must say so
+    rather than emit a confident number - that is the whole argument for
+    pricing_blank, and a wrong number in the pricing column is worse than a
+    blank one.
+    """
+    frac = (stats or {}).get('matched_fraction', None)
+    if n_matched < NULL_K_MIN_MEANINGFUL:
+        why = (f'matched null holds {n_matched} IN-BAND signals (< {NULL_K_MIN_MEANINGFUL}) '
+               f'against a request of {k_requested}')
+        if frac is not None:
+            why += (f'; matched fraction {frac:.1%} at tol +/-{(stats or {}).get("tol", 0):.0%} '
+                    f'for targets {(stats or {}).get("target_min", "?")}..'
+                    f'{(stats or {}).get("target_max", "?")} fires')
+        why += (f'. The exceedance floor is 1/{max(n_matched, 1)} and cannot resolve a tail, so the '
+                f'Appendix A columns are BLANK rather than confidently wrong.')
+        return ('null_too_small', why)
     return ('', '')
 
 

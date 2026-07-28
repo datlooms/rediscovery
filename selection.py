@@ -269,7 +269,7 @@ def cofire_book_all_pairs_DIAGNOSTIC(M):
     return float(off.mean())
 
 
-def clusters_from_entries(bars, n_tol, signal_ids=None):
+def clusters_from_entries(bars, n_tol, signal_ids):
     """Item 4: a run's size is the count of DISTINCT signals in it, not entry rows.
 
     The same signal re-firing inside a tolerance window was previously counted as

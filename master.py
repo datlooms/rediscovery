@@ -837,6 +837,7 @@ def _no_constraint(_d, _ss):
 
 
 NULL_SEED_BASE = 20260728
+CONCURRENT_STAGES = ('S3', 'S5C', 'S5D', 'S7')
 
 
 def s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest, null_k=None):
@@ -1361,7 +1362,8 @@ def s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest
                                                      int(mm.group(2)), anchor), dtype=bool)
                 else:
                     mk = np.asarray(score_g.family_mask(df, pool, fam, sig, ad, st), dtype=bool)
-            except SystemExit:
+            except SystemExit as _e:
+                rl.warn(f'S5D candidate skipped ({fam}): {_e}')
                 skipped += 1
                 continue
             cand_bars[d][key] = np.flatnonzero(mk & entry_ok_sel).astype(np.int64)
@@ -1655,14 +1657,21 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
     print(f'  ITEM 18 ARMS AGREE (asserted, abort on mismatch): persist = '
           f'{agree["persist_definition"]}')
     print(f'    denominator = {agree["denominator_definition"]}')
+    if not _pool_ok:
+        print(f'  BOOK ARM SKIPPED: {_pool_why}. book_rates stay nan and the criterion will read '
+              f'UNEVALUABLE. THIS LINE EXISTS SO A nan IS ALWAYS ATTRIBUTABLE: without it, "no pool, '
+              f'correctly skipped" and "pool present but the provenance stamp did not match" are '
+              f'indistinguishable on the console, which is exactly what concealed a key mismatch '
+              f'through three deliveries.', flush=True)
     if _pool_ok:
         import catalogue as cat2
         cands_wf = pd.read_csv(_cand)
         conv_wf = C.build_conviction(df, True, True, True, d2d_conviction=True, d2d_gap=True)
         arm = wfs.book_arm_from_valid(df, cands_wf, pool, anchor, ad, st, w, splits,
                                       score_g.build_book, engine.run_portfolio,
-                                      cat2.evaluate_valid, conviction=conv_wf,
-                                      gap_names=cp.GAP_NAMES)
+                                      cat2.evaluate_valid,
+                                      pd.Series(df['Time'].astype(str).values).str[:10].values,
+                                      conviction=conv_wf, gap_names=cp.GAP_NAMES)
         book_rates = [a_['rate'] for a_ in arm]
         for a_ in arm:
             print(f'    split {a_["split"]}: VALID admitted {a_["entities"]} on train, '
@@ -1981,6 +1990,7 @@ def resolve_book(book):
 
 
 def main():
+    import runlog as rl
     for _stream in (sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding='utf-8', errors='replace')
@@ -2002,6 +2012,7 @@ def main():
                     help='cap each family to the first N axis units, applied to BOTH parity legs')
     args = ap.parse_args()
     args.workers = min(args.workers, 16)
+    os.environ['DOT_WORKERS'] = str(args.workers)
 
     t0 = time.time()
     print('═' * 68)
@@ -2019,7 +2030,10 @@ def main():
 
     only = args.stage
     print('\n[S0] INGEST & VALIDATE')
-    df, attest, input_sha = s0_ingest(data_dir, out)
+    _logp = rl.open_run_log(out)
+    print(f'  run log -> {_logp} (ATTESTATION RECORD: carries wall-clock; every CSV does not)')
+    with rl.Stage('S0', 'ingest & validate'):
+        df, attest, input_sha = s0_ingest(data_dir, out)
     bind_ingested_frame_permanently(df, input_sha, os.path.join(out, 'results'))
     print('\n[S1] ADAPTIVE THRESHOLDS (oracle)')
     ad, st = s1_thresholds(df)
@@ -2067,7 +2081,8 @@ def main():
     run_all = only is None
     if run_all or only == 'S2B':
         print('\n[S2B] MARKET TERRAIN MAP')
-        terrain_state = s2b_terrain(df, w, out, input_sha, attest)
+        with rl.Stage('S2B', 'market terrain map'):
+            terrain_state = s2b_terrain(df, w, out, input_sha, attest)
     discover = (book_file is None)
     if not discover and run_all:
         print('\n[S3–S6] DISCOVERY / REGEN — SKIPPED on the frozen-book verification path.')
@@ -2091,7 +2106,8 @@ def main():
         s6_regen(out, input_sha)
     if run_all or only == 'S5D':
         print('\n[S5D] CATALOGUE - fourteen per-family books, every VALID signal')
-        catalogue_state = s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest)
+        with rl.Stage('S5D', 'catalogue emission'):
+            catalogue_state = s5d_catalogue(df, ad, st, w, pool, anchor, out, input_sha, attest)
     if run_all or only == 'S5B':
         print('\n[S5B] SELECTION LAYER')
         selection_state = s5b_selection(df, ad, st, w, pool, anchor, book_file, out, input_sha, attest)
@@ -2112,7 +2128,9 @@ def main():
         profile = s8b_cluster_profile(df, ad, st, w, pool, anchor, book_file, committed, out, input_sha, attest)
     if run_all or only == 'S9':
         print('\n[S9] REPORT & SPLIT')
-        s9_report(out, attest, contenders, committed, sacred, args.market_label, input_sha, profile, evidence, selection_state)
+        with rl.Stage('S9', 'report'):
+            s9_report(out, attest, contenders, committed, sacred, args.market_label, input_sha, profile, evidence, selection_state)
+    rl.print_timing_table(concurrent_stages=CONCURRENT_STAGES)
 
     print('\n' + '═' * 68)
     print(f'MASTER COMPLETE in {_hms(time.time() - t0)} | out: {out}')

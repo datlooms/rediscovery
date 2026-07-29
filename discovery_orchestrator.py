@@ -418,10 +418,78 @@ def run_f0_chunk(df, adaptive, structural, warmup, kw, lo, hi):
     return list(survivors), f0_combo_count(kw, lo, hi)
 
 
-def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors):
+def _f0_score_chunk(payload):
+    lo, hi, scope, frame_path = payload
+    import discovery_orchestrator as orch
+    df, adaptive, structural, warmup, _kw = orch._worker_context(scope, frame_path, 'F0')
+    import pickle as _pk
+    with open(orch._F0_KEPT_PATH, 'rb') as f:
+        kept = _pk.load(f)
+    month = pd.Series(df['Time'].values).str[:7].values
+    return lo, [f0s.score_survivor(df, row, month, adaptive, structural, warmup)
+                for row in kept[lo:hi]]
+
+
+_F0_KEPT_PATH = None
+
+
+def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1,
+                     scope='full', frame_path=None, results_dir=None):
+    """Item 19: the RE-SCORE parallelises. THE DEDUP DOES NOT.
+
+    deduplicate() is a global greedy pass against a running keep-set: each
+    candidate is compared with every set already kept, so splitting it lets
+    near-duplicates survive in different shards and reunite in the output. It
+    stays SINGLE-PASS IN ASCENDING CHUNK ORDER. Only the per-survivor re-score
+    parallelises, and each of those is genuinely independent - 19,757 of them,
+    measured at ~5 hours single-threaded, which is why this is the stage worth
+    parallelising at all.
+
+    A PARITY PROOF AGAINST THE SERIAL RESULT IS MANDATORY and is what
+    f0_parity_proof() runs.
+    """
+    global _F0_KEPT_PATH
     kept = f0m.deduplicate(list(raw_survivors))
     month = pd.Series(df['Time'].values).str[:7].values
-    return [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept]
+    if workers <= 1 or frame_path is None or results_dir is None or len(kept) < 64:
+        return [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept]
+    import pickle as _pk
+    _F0_KEPT_PATH = os.path.join(results_dir, '_f0_kept.pkl')
+    with open(_F0_KEPT_PATH, 'wb') as f:
+        _pk.dump(kept, f)
+    n = len(kept)
+    size = max(1, -(-n // (workers * 4)))
+    bounds = [(i, min(i + size, n)) for i in range(0, n, size)]
+    out = {}
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as _mp
+    import runlog as _rl
+    payloads = [(lo, hi, scope, frame_path) for lo, hi in bounds]
+    with _rl.Progress('F0 re-score', len(payloads)) as pg:
+        with ProcessPoolExecutor(max_workers=min(workers, len(payloads)),
+                                 mp_context=_mp.get_context('spawn')) as ex:
+            for lo, rows in ex.map(_f0_score_chunk, payloads):
+                out[lo] = rows
+                pg.step(1)
+    return [r for lo, _hi in bounds for r in out[lo]]
+
+
+def f0_parity_proof(df, adaptive, structural, warmup, raw_survivors, workers, scope, frame_path,
+                    results_dir):
+    """Mandatory: the parallel re-score must equal the serial one, row for row."""
+    ser = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1)
+    par = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=workers,
+                           scope=scope, frame_path=frame_path, results_dir=results_dir)
+    a_ = pd.DataFrame(ser, columns=SCHEMA)
+    b_ = pd.DataFrame(par, columns=SCHEMA)
+    same = a_.equals(b_)
+    print(f'  F0 RE-SCORE PARITY: serial {len(a_)} rows vs parallel {len(b_)} rows | '
+          f'IDENTICAL: {same} | dedup ran SERIALLY in both, only the re-score parallelised',
+          flush=True)
+    if not same:
+        raise SystemExit('ABORT [item 19] the parallel F0 re-score does not equal the serial one. '
+                         'The parity proof is mandatory and it failed.')
+    return same
 
 
 def _f0_chunk_pickle(script, idx):
@@ -441,7 +509,12 @@ def collate_f0(script, n_chunks, df, adaptive, structural, warmup, expected_tota
         with open(pk, 'rb') as f:
             raw.extend(pickle.load(f))
     n_raw = len(raw)
-    rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw)
+    _wk = int(os.environ.get('DOT_WORKERS', '1'))
+    _fp = os.environ.get('DOT_FRAME_PATH') or None
+    if _wk > 1 and _fp:
+        f0_parity_proof(df, adaptive, structural, warmup, raw, _wk, 'full', _fp, RESULTS_DIR)
+    rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw, workers=_wk, scope='full',
+                            frame_path=_fp, results_dir=RESULTS_DIR)
     csv, done = _family_paths('F0', script)
     _write_atomic_csv(pd.DataFrame(rows, columns=SCHEMA), csv)
     _mark_family_done(csv, done, len(rows))

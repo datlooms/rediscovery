@@ -691,7 +691,8 @@ def assert_split_shape(splits):
 
 
 def book_arm_from_valid(df, cands, pool, anchor, ad, st, warmup, splits, build_book_fn,
-                        run_portfolio_fn, evaluate_valid_fn, conviction=None, gap_names=()):
+                        run_portfolio_fn, evaluate_valid_fn, bar_day, conviction=None,
+                        gap_names=()):
     """Item 17: per split, apply VALID on the TRAINING SEGMENT ALONE, score on TEST.
 
     IT CERTIFIES THE CATALOGUE'S INCLUSION RULE, NOT ANY BOOK. The entities are
@@ -700,6 +701,13 @@ def book_arm_from_valid(df, cands, pool, anchor, ad, st, warmup, splits, build_b
     thing that already failed - a validated generator is not a validated book.
     """
     assert_split_shape(splits)
+    if bar_day is None:
+        raise SystemExit(
+            'ABORT [item 17] bar_day is None. Appendix C V3b counts DISTINCT ENTRY-BASIS days; with '
+            'bar_day absent evaluate_valid falls back to exit-day groups, so the arm would apply a '
+            'V3b VARIANT while the catalogue and the null apply the specified one. Item 17 certifies '
+            'VALID and Appendix A requires the null to run the IDENTICAL predicate, so a divergence '
+            'in even one clause breaks the thing this stage exists to certify.')
     out = []
     for s_i, sp in enumerate(splits):
         tr_lo, tr_hi = int(sp['train_first_bar']), int(sp['train_last_bar'])
@@ -722,7 +730,7 @@ def book_arm_from_valid(df, cands, pool, anchor, ad, st, warmup, splits, build_b
             eb = np.asarray(td['entry_bar'].values, dtype=np.int64)
             tr_t = td[(eb >= tr_lo) & (eb <= tr_hi)]
             te_t = td[(eb >= te_lo) & (eb <= te_hi)]
-            verdict, _reason, _stats = evaluate_valid_fn(tr_t, None)
+            verdict, _reason, _stats = evaluate_valid_fn(tr_t, bar_day)
             if verdict != 'VALID':
                 continue
             name = f'{fam}|{sig}|{direction}'

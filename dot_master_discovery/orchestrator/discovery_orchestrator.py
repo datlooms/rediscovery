@@ -477,6 +477,45 @@ def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1,
 F0_PARITY_SAMPLE = 512
 
 
+def _f0_code_sha():
+    """The proof certifies CODE, so the attestation key must include the code."""
+    import hashlib as _h
+    h = _h.sha256()
+    for rel in ('orchestrator/discovery_orchestrator.py', 'scanners/f0_to_schema.py',
+                'scanners/triple_convergence_and_d2ddir.py'):
+        p_ = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), rel)
+        if os.path.exists(p_):
+            h.update(open(p_, 'rb').read())
+    return h.hexdigest()[:12]
+
+
+def _stratified_indices(n_total, n_sample, workers):
+    """C1: a CONTIGUOUS HEAD exercises zero chunk boundaries at realistic worker counts.
+
+    With n=19,757 and chunk size ceil(n/(workers*4)), the first 512 survivors sit
+    inside chunk 0 at every worker count up to 8 - including the default of 2 -
+    so a head-bounded proof touches NO boundary. Chunk-boundary coverage was
+    ruled sufficient when the proof ran over the full population; bounding it to
+    a head silently voided that. A stratified spread across the whole index range
+    costs the same and covers every boundary at any worker count. Deterministic,
+    so kept[i] and par[i] index the same survivor.
+    """
+    if n_sample >= n_total:
+        return list(range(n_total))
+    idx = set()
+    size = max(1, -(-n_total // max(int(workers), 1) // 4))
+    for b in range(0, n_total, size):
+        for off in (0, 1):
+            if b + off < n_total:
+                idx.add(b + off)
+    stride = max(1, n_total // max(n_sample - len(idx), 1))
+    for i in range(0, n_total, stride):
+        if len(idx) >= n_sample:
+            break
+        idx.add(i)
+    return sorted(idx)[:max(n_sample, len(idx))]
+
+
 def _parity_attest_path(results_dir):
     return os.path.join(results_dir, '_f0_parity.attest')
 
@@ -502,30 +541,37 @@ def f0_parity_proof(df, adaptive, structural, warmup, raw_survivors, workers, sc
     par = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=workers,
                            scope=scope, frame_path=frame_path, results_dir=results_dir)
     att = _parity_attest_path(results_dir)
+    key = f'{input_sha}|{_f0_code_sha()}'
     if input_sha and os.path.exists(att):
         prev = open(att, 'r', encoding='utf-8').read().strip()
-        if prev == input_sha:
-            print(f'  F0 RE-SCORE PARITY: already attested for input_sha {input_sha} '
-                  f'({os.path.basename(att)}) - the bounded serial reference is paid ONCE per '
-                  f'dataset, not on every run.', flush=True)
+        if prev == key:
+            print(f'  F0 RE-SCORE PARITY: already attested for input_sha+code_sha {key[:29]}... '
+                  f'({os.path.basename(att)}) - paid once per DATASET AND CODE STATE. Keying on '
+                  f'input_sha alone would skip the proof after a change to score_survivor, the '
+                  f'chunking or the reassembly against an unchanged dataset, and the proof exists '
+                  f'to certify CODE.', flush=True)
             return True, par
-    n = min(int(F0_PARITY_SAMPLE), len(par))
-    kept_prefix = f0m.deduplicate(list(raw_survivors))[:n]
+    kept = f0m.deduplicate(list(raw_survivors))
+    n = min(int(F0_PARITY_SAMPLE), len(kept))
+    idx = _stratified_indices(len(kept), n, workers)
     month = pd.Series(df['Time'].values).str[:7].values
-    ser = [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept_prefix]
+    ser = [f0s.score_survivor(df, kept[i], month, adaptive, structural, warmup) for i in idx]
     a_ = pd.DataFrame(ser, columns=SCHEMA).reset_index(drop=True)
-    b_ = pd.DataFrame(par[:n], columns=SCHEMA).reset_index(drop=True)
+    b_ = pd.DataFrame([par[i] for i in idx], columns=SCHEMA).reset_index(drop=True)
     same = a_.equals(b_)
     print(f'  F0 RE-SCORE PARITY: serial reference on a bounded {n}-survivor prefix vs the same '
           f'prefix of the parallel result | IDENTICAL: {same} | dedup ran SERIALLY in both, only '
-          f'the re-score parallelised | full parallel pass computed ONCE and reused', flush=True)
+          f'the re-score parallelised | full parallel pass computed ONCE and reused | sample is '
+          f'STRATIFIED across the index range so every chunk boundary is covered at any worker '
+          f'count | this reference is ~{100.0*n/max(len(par),1):.1f}% of a serial pass and is paid '
+          f'on the FIRST run per dataset+code only, zero thereafter', flush=True)
     if not same:
         raise SystemExit('ABORT [item 19] the parallel F0 re-score does not equal the serial one. '
                          'The parity proof is mandatory and it failed.')
     if input_sha:
         tmp = att + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            f.write(input_sha)
+            f.write(key)
         os.replace(tmp, att)
     return same, par
 

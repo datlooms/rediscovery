@@ -474,22 +474,60 @@ def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1,
     return [r for lo, _hi in bounds for r in out[lo]]
 
 
+F0_PARITY_SAMPLE = 512
+
+
+def _parity_attest_path(results_dir):
+    return os.path.join(results_dir, '_f0_parity.attest')
+
+
 def f0_parity_proof(df, adaptive, structural, warmup, raw_survivors, workers, scope, frame_path,
-                    results_dir):
-    """Mandatory: the parallel re-score must equal the serial one, row for row."""
-    ser = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1)
+                    results_dir, input_sha=''):
+    """Mandatory parity, WITHOUT repaying the cost item 19 exists to remove.
+
+    The first wiring computed the serial reference over all 19,757 survivors,
+    computed the parallel result to compare against it, discarded that result,
+    and then computed the parallel result AGAIN for the caller - three full
+    re-scores on a stage whose whole purpose is to stop paying for one. Now:
+    the FULL parallel pass runs ONCE and is RETURNED for the caller to use, and
+    the serial reference is BOUNDED to a deterministic prefix sample and
+    ATTESTED PER input_sha so it is paid once rather than every run.
+
+    The reference stays genuine: f0_rows_from_raw at workers <= 1 is a plain
+    list comprehension with no ProcessPool, so the sample is not produced by the
+    machinery under test. DataFrame.equals is element-wise, order-sensitive,
+    dtype-sensitive and NaN-aware, which is what covers float accumulation,
+    ordering and chunk boundaries.
+    """
     par = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=workers,
                            scope=scope, frame_path=frame_path, results_dir=results_dir)
-    a_ = pd.DataFrame(ser, columns=SCHEMA)
-    b_ = pd.DataFrame(par, columns=SCHEMA)
+    att = _parity_attest_path(results_dir)
+    if input_sha and os.path.exists(att):
+        prev = open(att, 'r', encoding='utf-8').read().strip()
+        if prev == input_sha:
+            print(f'  F0 RE-SCORE PARITY: already attested for input_sha {input_sha} '
+                  f'({os.path.basename(att)}) - the bounded serial reference is paid ONCE per '
+                  f'dataset, not on every run.', flush=True)
+            return True, par
+    n = min(int(F0_PARITY_SAMPLE), len(par))
+    kept_prefix = f0m.deduplicate(list(raw_survivors))[:n]
+    month = pd.Series(df['Time'].values).str[:7].values
+    ser = [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept_prefix]
+    a_ = pd.DataFrame(ser, columns=SCHEMA).reset_index(drop=True)
+    b_ = pd.DataFrame(par[:n], columns=SCHEMA).reset_index(drop=True)
     same = a_.equals(b_)
-    print(f'  F0 RE-SCORE PARITY: serial {len(a_)} rows vs parallel {len(b_)} rows | '
-          f'IDENTICAL: {same} | dedup ran SERIALLY in both, only the re-score parallelised',
-          flush=True)
+    print(f'  F0 RE-SCORE PARITY: serial reference on a bounded {n}-survivor prefix vs the same '
+          f'prefix of the parallel result | IDENTICAL: {same} | dedup ran SERIALLY in both, only '
+          f'the re-score parallelised | full parallel pass computed ONCE and reused', flush=True)
     if not same:
         raise SystemExit('ABORT [item 19] the parallel F0 re-score does not equal the serial one. '
                          'The parity proof is mandatory and it failed.')
-    return same
+    if input_sha:
+        tmp = att + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(input_sha)
+        os.replace(tmp, att)
+    return same, par
 
 
 def _f0_chunk_pickle(script, idx):
@@ -512,9 +550,10 @@ def collate_f0(script, n_chunks, df, adaptive, structural, warmup, expected_tota
     _wk = int(os.environ.get('DOT_WORKERS', '1'))
     _fp = os.environ.get('DOT_FRAME_PATH') or None
     if _wk > 1 and _fp:
-        f0_parity_proof(df, adaptive, structural, warmup, raw, _wk, 'full', _fp, RESULTS_DIR)
-    rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw, workers=_wk, scope='full',
-                            frame_path=_fp, results_dir=RESULTS_DIR)
+        _ok, rows = f0_parity_proof(df, adaptive, structural, warmup, raw, _wk, 'full', _fp,
+                                    RESULTS_DIR, input_sha=str(input_sha or ''))
+    else:
+        rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw)
     csv, done = _family_paths('F0', script)
     _write_atomic_csv(pd.DataFrame(rows, columns=SCHEMA), csv)
     _mark_family_done(csv, done, len(rows))

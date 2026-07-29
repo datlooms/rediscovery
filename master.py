@@ -1443,6 +1443,11 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
     n0 = len(df)
     wfs.assert_no_row_deletion(df, n0)
     splits, day_tbl, meta = wfs.derive_splits(df, w)
+    wfs.assert_split_shape(splits)
+    print(f'  ITEM 17 SPLIT SHAPE ASSERTED at derivation ({len(splits)} splits) - not '
+          f'only inside the book arm, which sits behind the pool gate and does not run '
+          f'on a pool-less run. A key drift would otherwise surface on the one night the '
+          f'real run happens.')
     if not splits:
         print('  S5C: the floor admits no valid split; walk-forward is not executable on this dataset.')
         mark_done(out, 'S5C', {'input_sha': input_sha, 'splits': 0})

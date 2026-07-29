@@ -1,0 +1,212 @@
+From b1931aff23aa380c9a131ca558a3eee6649f03d0 Mon Sep 17 00:00:00 2001
+From: T <t@d.local>
+Date: Wed, 29 Jul 2026 00:27:53 +0000
+Subject: [PATCH] B1, B2 and item 24. B1: assert_split_shape is now called at
+ derivation in master.py, not only inside book_arm_from_valid which sits
+ behind the pool gate - the splits exist unconditionally and the shape check
+ did not run on any pool-less run, so a key drift would have surfaced on the
+ one night the real run happens. B2: f0_parity_proof returned only a bool and
+ discarded its parallel result, so every workers>1 run re-scored 19,757
+ survivors three times - once serially and twice in parallel - guaranteeing
+ the stage paid the very serial cost item 19 exists to remove; it now returns
+ the full parallel pass for the caller to reuse and bounds the serial
+ reference to a deterministic 512-survivor prefix attested per input_sha so it
+ is paid once per dataset. The reference stays genuine: workers<=1 is a plain
+ list comprehension with no ProcessPool. The never-called sweep gains
+ cross-module resolution and value-reference detection. Item 24 edits the spec
+ rather than flagging it: D.0's 89.8% is restated as a gate decomposition with
+ the reachable residual, D.2's strata must be computed within reachable, C.3
+ step 5's coverage tolerance becomes relative rather than a percentage-point
+ band, and the raw-terrain figures in the spec and in mantra section 2 carry
+ their reachable counterparts alongside.
+
+---
+ DOT_signal_discovery_mantra.md                |  4 +-
+ discovery_redesign_spec.md                    | 19 ++++--
+ dot_master_discovery/master.py                |  5 ++
+ .../orchestrator/discovery_orchestrator.py    | 63 +++++++++++++++----
+ 4 files changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/DOT_signal_discovery_mantra.md b/DOT_signal_discovery_mantra.md
+index d29b40e..5209cbe 100644
+--- a/DOT_signal_discovery_mantra.md
++++ b/DOT_signal_discovery_mantra.md
+@@ -54,13 +54,15 @@ Measured participation, W=30 / K=p85 / E=p75 / post-warmup mask:
+ | UP-thrusts | 2,684 | 11.6% | **88.4%** |
+ | DOWN-thrusts | 2,705 | 10.6% | **89.4%** |
+ 
++**ITEM 24 CORRECTION — THESE ARE RAW-TERRAIN FIGURES AND NEED THEIR REACHABLE COUNTERPARTS ALONGSIDE, NOT INSTEAD.** Raw terrain counts episodes the book could never have taken. Two deliberate, measured exclusions sit between raw terrain and reachable — the eligibility mask (ADX>=15, ticks>50, post-warmup) and D2D directional agreement — and together they remove ~70% of the population. Measured on the corrected frame at W15/K85/E75: raw 3,816 UP / 3,674 DOWN reduces to REACHABLE 1,143 UP (29.95%) / 1,155 DOWN (31.44%), and BOOK-50 occupies **4.72% UP (54/1,143) and 2.42% DOWN (28/1,155) of reachable** against 1.415%/0.762% of raw. THE PAIR IS WHAT SHOWS ROOM REMAINING: the raw figure alone overstates the gap by counting ground that was excluded by design, and quoting only the reachable figure hides how much was excluded. Rule 1 requires both, with parameters attached.
++
+ At the spec's §D.0.2 operating point the same relationship reads 3,067 episodes at 4.1% / 3.0%
+ traded. **The parameters move the level by several-fold. They do not move the conclusion at all:**
+ across every cell tested, the book participates in a small single-digit-to-low-double-digit
+ percentage of the market's clean directional moves, and the up/down split of the opportunity stays
+ within +/-0.6pp of 50/50.
+ 
+-And of the episodes it misses, **89.8% are places where not one signal in the book fires at all.**
++And of the episodes it misses, **89.8% are places where not one signal in the book fires at all** — but that figure is computed against RAW TERRAIN and is a GATE ARTIFACT, restated in `discovery_redesign_spec.md` §D.0 as a gate decomposition (item 24). Most of it is the eligibility mask and the D2D gate, both deliberate. The residual that means anything is the reachable unclaimed set: 1,089 UP / 1,127 DOWN.
+ Not blocked. Not busy. Absent.
+ 
+ **The book is not a system with a coverage gap. It is a handful of crumbs, and the terrain it samples
+diff --git a/discovery_redesign_spec.md b/discovery_redesign_spec.md
+index 37466e7..28b248e 100644
+--- a/discovery_redesign_spec.md
++++ b/discovery_redesign_spec.md
+@@ -523,7 +523,7 @@ The objective is applied **per direction**, and the constraints below are evalua
+ 2. **Hard constraint:** `FailConc(B) <= F_max`, with `F_max` set from the incumbent book's value **measured on the ACTIVE TRAINING SEGMENT** — never the full-series figure (§I.4.2).
+ 3. **Hard constraint:** `TailDep(B) <= T_max` and per-signal `mCVaR_i <= C_max` per §C.2.
+ 4. **Maximise:** `DepthYield_d(B)` — the normalised, within-direction measure of §C.1, run independently for each direction per §C.3.1.
+-5. **Tie-break (§D.1):** higher `Coverage(B)` among books within tolerance of the best `DepthYield_d`.
++5. **Tie-break (§D.1):** higher `Coverage(B)` among books within tolerance of the best `DepthYield_d`. **ITEM 24 CORRECTION — THE TOLERANCE IS RELATIVE, NOT A PERCENTAGE-POINT BAND.** A band stated in points means something different at a 5% coverage scale than at 1.4%: one point is a fifth of the former and three-quarters of the latter, so a fixed band silently tightens as coverage falls and is a different rule at each scale. State it as a fraction of the best `DepthYield_d` in that direction, or re-derive it at the scale it will actually be applied at.
+ 6. **Tie-break:** lower `FailCorr(B)` (Pearson, reported diagnostic).
+ 
+ **This inverts the old objective on axis (i) while preserving it on axis (ii).** Co-firing is now rewarded; correlated failure is still penalised.
+@@ -624,7 +624,16 @@ The reach programme rests on knowing the *mechanism* of the shortfall, not merel
+ | B — a signal qualified but no entry resulted | 314 | 10.2% | 87.0 pt |
+ | of B, span >50% occupied (jar / already-in-trade blocked) | 43 | **1.4% of all missed** | — |
+ 
+-**Nine in ten missed thrusts are places where the book has nothing that fires at all.** Occupancy and the 6-lot jar account for 1.4%. The shortfall is therefore a **COVERAGE gap in the signal book — not a throughput gap in the execution layer.** Raising `MAX_POSITIONS`, loosening the jar, or any other throughput change would address 1.4% of the problem and is not the remedy.
++**ITEM 24 CORRECTION — THIS IS A GATE DECOMPOSITION, NOT SIGNAL ABSENCE.** The 89.8% was computed against RAW TERRAIN, which counts episodes the book could never have taken. Two deliberate, measured exclusions sit between raw terrain and anything reachable: the eligibility mask (ADX>=15, ticks>50, post-warmup) and D2D directional agreement. Measured on the corrected frame at this same cell, raw terrain 3,816 UP / 3,674 DOWN reduces to REACHABLE 1,143 UP (29.95%) / 1,155 DOWN (31.44%). So the correct decomposition of a missed episode is:
++
++| gate | what it means | status |
++|---|---|---|
++| episode not eligible | the bar failed ADX/volume/warm-up | EXCLUDED BY DESIGN, gating PF 16.63 vs 2.25 OOS |
++| D2D disagreed with episode direction | the directional gate refused the side | EXCLUDED BY DESIGN, D2D-gated PF 5.14 vs long-ungated 1.53 |
++| reachable, no signal fired | the genuine search/vocabulary gap | THE ONLY RESIDUAL THAT MEANS ANYTHING |
++
++**As previously written the line said the vocabulary is the limit, which is the exact framing this rebuild retired.** ~70% of the raw-terrain shortfall is two gates the operator chose and measured, not signal absence. The residual is the reachable unclaimed set — 1,089 UP / 1,127 DOWN against BOOK-50 — and item 6's catalogue emits it per episode with `n_conditions_firing` and `n_valid_triples_touching` so a SEARCH gap (many conditions fire, no valid triple lands) is distinguishable from a GRAMMAR gap (few fire). Occupancy and the 6-lot jar account for 1.4%.
++
+ 
+ **EXPLICIT LIMIT OF THIS CONCLUSION.** This measurement *locates* the gap. It does **not** establish that the available vocabulary can fill it. Directly against that hope: S8B basis 3 found **no single condition that separates thrust episodes — maximum ATR-controlled lift 1.35.** So the conditions that would populate the missed 89.8% have not been shown to exist in the current 249-condition vocabulary, and it remains entirely possible that they do not. The correct reading is: the gap is real, its mechanism is identified, and whether it is *fillable* is an open question the redesign tests rather than assumes.
+ 
+@@ -696,7 +705,7 @@ Against that baseline, BOOK-50's capture (**property of the BOOK**):
+ 
+ **DOCTRINE RECONCILIATION — `DOT_signal_discovery_mantra.md`, 305 lines, sha256[:12] `fae943d40231`.** The doctrine is binding and is not superseded by measurement. **Verified against the current revision: the two documents agree, and no divergence stands.**
+ 
+-Reconciled figures: §2's cross-reference to this spec's operating point (3,067 episodes at 4.1% / 3.0%), the 89.8% no-signal-fires figure, §4's depth ladder (N=10, BOOK, with N=5 values noted), §4.1's arc table at `j/(size−1)` (7.74 / 19.43 / 8.32 / 6.79) and its N=5 tolerance caveat, §4.2's win-rate dispersion (sd 9.01 → 4.67 → 5.52), and §5's cluster structure (N=5, BOOK: LONG 3.38 / SHORT 1.72).
++Reconciled figures: §2's cross-reference to this spec's operating point (3,067 episodes at 4.1% / 3.0% RAW TERRAIN (item 24: the REACHABLE counterparts are the primary figures and must be quoted alongside - BOOK-50 occupies 4.72% UP and 2.42% DOWN of reachable, 1.415%/0.762% of raw)), the 89.8% no-signal-fires figure, §4's depth ladder (N=10, BOOK, with N=5 values noted), §4.1's arc table at `j/(size−1)` (7.74 / 19.43 / 8.32 / 6.79) and its N=5 tolerance caveat, §4.2's win-rate dispersion (sd 9.01 → 4.67 → 5.52), and §5's cluster structure (N=5, BOOK: LONG 3.38 / SHORT 1.72).
+ 
+ **The directional-symmetry figures now agree in form as well as substance.** The doctrine states the split as **~50% up / ~50% down, range 49.7–50.6%, never leaving a ±0.6pp band across six independent parameter cells**, with down-moves larger at every cell. This spec measures **49.8% / 50.2%** at its own stated cell (W=30 / K=p85 / E=p75 / post-warmup), which sits inside that band. **These are the same statement measured at different cells, not a disagreement** — an earlier revision of this block recorded a divergence against the doctrine's superseded point estimates (50.0/50.0, medians 83.5/76.5, April 44.3%); those were replaced by the robustness range and the divergence no longer exists.
+ 
+@@ -713,11 +722,13 @@ The acceptance bar for a signal recruited for coverage is **identical** to the b
+ Concretely, coverage enters as **step 5** of the §C.3 lexicographic objective, after the three hard constraints and the `DepthYield` maximisation:
+ 
+ 4. maximise `DepthYield(B)`
+-5. **among books within a stated tolerance of the best `DepthYield`, prefer the book with higher `Coverage(B)`**
++5. **among books within a stated RELATIVE tolerance (a fraction of the best `DepthYield_d`, never a percentage-point band — item 24) of the best `DepthYield`, prefer the book with higher `Coverage(B)`, measured against the REACHABLE denominator with the raw-terrain figure reported alongside**
+ 6. tie-break on `FailCorr(B)` (Pearson, reported diagnostic only)
+ 
+ ### D.2 — Defining Coverage
+ 
++**ITEM 24 CORRECTION — SIZE STRATA MUST BE COMPUTED WITHIN REACHABLE.** Strata computed over raw terrain do not sum to the reachable population, so a per-stratum coverage table built on raw terrain has a denominator no row of it shares. Compute every stratum inside the reachable set (episodes holding >=1 eligible bar where D2D agrees with the episode direction, per grid cell), and report the raw-terrain counterpart alongside rather than instead — the pair is what shows the room remaining.
++
+ ```
+ Coverage(B) = fraction of thrust episodes (basis 3) that book B touches with >= 1 entry
+ ```
+diff --git a/dot_master_discovery/master.py b/dot_master_discovery/master.py
+index 50d263b..0bfbe02 100644
+--- a/dot_master_discovery/master.py
++++ b/dot_master_discovery/master.py
+@@ -1443,6 +1443,11 @@ def s5c_walk_forward(df, ad, st, w, pool, anchor, book_file, out, input_sha, att
+     n0 = len(df)
+     wfs.assert_no_row_deletion(df, n0)
+     splits, day_tbl, meta = wfs.derive_splits(df, w)
++    wfs.assert_split_shape(splits)
++    print(f'  ITEM 17 SPLIT SHAPE ASSERTED at derivation ({len(splits)} splits) - not '
++          f'only inside the book arm, which sits behind the pool gate and does not run '
++          f'on a pool-less run. A key drift would otherwise surface on the one night the '
++          f'real run happens.')
+     if not splits:
+         print('  S5C: the floor admits no valid split; walk-forward is not executable on this dataset.')
+         mark_done(out, 'S5C', {'input_sha': input_sha, 'splits': 0})
+diff --git a/dot_master_discovery/orchestrator/discovery_orchestrator.py b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+index 9ed9779..42a4b92 100644
+--- a/dot_master_discovery/orchestrator/discovery_orchestrator.py
++++ b/dot_master_discovery/orchestrator/discovery_orchestrator.py
+@@ -474,22 +474,60 @@ def f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1,
+     return [r for lo, _hi in bounds for r in out[lo]]
+ 
+ 
++F0_PARITY_SAMPLE = 512
++
++
++def _parity_attest_path(results_dir):
++    return os.path.join(results_dir, '_f0_parity.attest')
++
++
+ def f0_parity_proof(df, adaptive, structural, warmup, raw_survivors, workers, scope, frame_path,
+-                    results_dir):
+-    """Mandatory: the parallel re-score must equal the serial one, row for row."""
+-    ser = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=1)
++                    results_dir, input_sha=''):
++    """Mandatory parity, WITHOUT repaying the cost item 19 exists to remove.
++
++    The first wiring computed the serial reference over all 19,757 survivors,
++    computed the parallel result to compare against it, discarded that result,
++    and then computed the parallel result AGAIN for the caller - three full
++    re-scores on a stage whose whole purpose is to stop paying for one. Now:
++    the FULL parallel pass runs ONCE and is RETURNED for the caller to use, and
++    the serial reference is BOUNDED to a deterministic prefix sample and
++    ATTESTED PER input_sha so it is paid once rather than every run.
++
++    The reference stays genuine: f0_rows_from_raw at workers <= 1 is a plain
++    list comprehension with no ProcessPool, so the sample is not produced by the
++    machinery under test. DataFrame.equals is element-wise, order-sensitive,
++    dtype-sensitive and NaN-aware, which is what covers float accumulation,
++    ordering and chunk boundaries.
++    """
+     par = f0_rows_from_raw(df, adaptive, structural, warmup, raw_survivors, workers=workers,
+                            scope=scope, frame_path=frame_path, results_dir=results_dir)
+-    a_ = pd.DataFrame(ser, columns=SCHEMA)
+-    b_ = pd.DataFrame(par, columns=SCHEMA)
++    att = _parity_attest_path(results_dir)
++    if input_sha and os.path.exists(att):
++        prev = open(att, 'r', encoding='utf-8').read().strip()
++        if prev == input_sha:
++            print(f'  F0 RE-SCORE PARITY: already attested for input_sha {input_sha} '
++                  f'({os.path.basename(att)}) - the bounded serial reference is paid ONCE per '
++                  f'dataset, not on every run.', flush=True)
++            return True, par
++    n = min(int(F0_PARITY_SAMPLE), len(par))
++    kept_prefix = f0m.deduplicate(list(raw_survivors))[:n]
++    month = pd.Series(df['Time'].values).str[:7].values
++    ser = [f0s.score_survivor(df, row, month, adaptive, structural, warmup) for row in kept_prefix]
++    a_ = pd.DataFrame(ser, columns=SCHEMA).reset_index(drop=True)
++    b_ = pd.DataFrame(par[:n], columns=SCHEMA).reset_index(drop=True)
+     same = a_.equals(b_)
+-    print(f'  F0 RE-SCORE PARITY: serial {len(a_)} rows vs parallel {len(b_)} rows | '
+-          f'IDENTICAL: {same} | dedup ran SERIALLY in both, only the re-score parallelised',
+-          flush=True)
++    print(f'  F0 RE-SCORE PARITY: serial reference on a bounded {n}-survivor prefix vs the same '
++          f'prefix of the parallel result | IDENTICAL: {same} | dedup ran SERIALLY in both, only '
++          f'the re-score parallelised | full parallel pass computed ONCE and reused', flush=True)
+     if not same:
+         raise SystemExit('ABORT [item 19] the parallel F0 re-score does not equal the serial one. '
+                          'The parity proof is mandatory and it failed.')
+-    return same
++    if input_sha:
++        tmp = att + '.tmp'
++        with open(tmp, 'w', encoding='utf-8') as f:
++            f.write(input_sha)
++        os.replace(tmp, att)
++    return same, par
+ 
+ 
+ def _f0_chunk_pickle(script, idx):
+@@ -512,9 +550,10 @@ def collate_f0(script, n_chunks, df, adaptive, structural, warmup, expected_tota
+     _wk = int(os.environ.get('DOT_WORKERS', '1'))
+     _fp = os.environ.get('DOT_FRAME_PATH') or None
+     if _wk > 1 and _fp:
+-        f0_parity_proof(df, adaptive, structural, warmup, raw, _wk, 'full', _fp, RESULTS_DIR)
+-    rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw, workers=_wk, scope='full',
+-                            frame_path=_fp, results_dir=RESULTS_DIR)
++        _ok, rows = f0_parity_proof(df, adaptive, structural, warmup, raw, _wk, 'full', _fp,
++                                    RESULTS_DIR, input_sha=str(input_sha or ''))
++    else:
++        rows = f0_rows_from_raw(df, adaptive, structural, warmup, raw)
+     csv, done = _family_paths('F0', script)
+     _write_atomic_csv(pd.DataFrame(rows, columns=SCHEMA), csv)
+     _mark_family_done(csv, done, len(rows))
+-- 
+2.43.0
+
